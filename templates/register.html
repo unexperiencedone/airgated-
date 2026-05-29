@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Local Device Registration</title>
+</head>
+<body>
+    <h2>Enroll Your Device (Day 1)</h2>
+    <form id="regForm" onsubmit="return false;"> <input type="text" id="roll" placeholder="Enter Roll Number" required><br><br>
+        <input type="text" id="name" placeholder="Enter Full Name" required><br><br>
+        <button type="button" id="regBtn" onclick="handleRegistration()">Register Device</button>
+    </form>
+
+    <div id="debug-log" style="margin-top:20px; color:blue; font-family:monospace;"></div>
+
+    <script>
+        function logStatus(msg) {
+            console.log(msg);
+            document.getElementById('debug-log').innerText += "\n> " + msg;
+        }
+
+        async function handleRegistration() {
+            document.getElementById('debug-log').innerText = ""; // Clear log
+            logStatus("Button clicked. Starting registration pipeline...");
+
+            const roll = document.getElementById('roll').value;
+            const name = document.getElementById('name').value;
+
+            if (!roll || !name) {
+                alert("Please fill in all fields.");
+                return;
+            }
+
+            // Disable button to prevent double clicks during calculation
+            document.getElementById('regBtn').disabled = true;
+
+            try {
+                logStatus("Checking Web Crypto API context...");
+                if (!window.crypto || !window.crypto.subtle) {
+                    throw new Error("Web Crypto API is NOT available. Check your Chrome flags or HTTPS secure context settings.");
+                }
+
+                logStatus("Generating secure hardware-bound keypair...");
+                const keyPair = await window.crypto.subtle.generateKey(
+                    {
+                        name: "RSASSA-PKCS1-v1_5",
+                        modulusLength: 2048,
+                        publicExponent: new Uint8Array([1, 0, 1]),
+                        hash: "SHA-256",
+                    },
+                    false, // Private key cannot be exported
+                    ["sign", "verify"]
+                );
+                logStatus("Keypair generated successfully!");
+
+                logStatus("Opening local IndexedDB storage...");
+                const openRequest = indexedDB.open("LocalDeviceAuth", 1);
+                
+                openRequest.onupgradeneeded = () => {
+                    logStatus("Creating fresh IndexedDB object store...");
+                    openRequest.result.createObjectStore("keys");
+                };
+
+                openRequest.onsuccess = async () => {
+                    logStatus("IndexedDB opened. Saving private identity token...");
+                    const db = openRequest.result;
+                    const tx = db.transaction("keys", "readwrite");
+                    tx.objectStore("keys").put(keyPair.privateKey, "sk");
+
+                    tx.oncomplete = async () => {
+                        logStatus("Private key securely locked to phone hardware.");
+                        
+                        logStatus("Exporting Public Key structure...");
+                        const exportedPub = await window.crypto.subtle.exportKey("spki", keyPair.publicKey);
+                        const pubHex = Array.prototype.map.call(new Uint8Array(exportedPub), x => ('0' + x.toString(16)).slice(-2)).join('');
+                        
+                        logStatus("Packaging network telemetry data...");
+                        const formData = new FormData();
+                        formData.append("roll_number", roll);
+                        formData.append("name", name);
+                        formData.append("public_key", pubHex);
+
+                        logStatus("Transmitting payload to local Python agent...");
+                        const res = await fetch("/api/register", { method: "POST", body: formData });
+                        const data = await res.json();
+                        
+                        logStatus("Server Response: " + JSON.stringify(data));
+                        alert(data.message || data.reason);
+                        document.getElementById('regBtn').disabled = false;
+                    };
+                };
+
+                openRequest.onerror = (e) => {
+                    throw new Error("IndexedDB database access denied: " + e.target.error);
+                };
+
+            } catch (error) {
+                logStatus("❌ CRITICAL ERROR: " + error.message);
+                alert("Pipeline Crashed: " + error.message);
+                document.getElementById('regBtn').disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>

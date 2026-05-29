@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Local Device Check-In</title>
+</head>
+<body>
+    <h2>Daily Class Check-In</h2>
+    
+    <div id="status-box" style="margin-bottom: 20px; padding: 10px; background-color: #f0f0f0;">
+        Status: Ready to check in.
+    </div>
+
+    <form id="checkinForm">
+        <input type="text" id="roll" placeholder="Enter Roll Number" required><br><br>
+        <button type="button" id="scanBtn" onclick="startCheckIn()">Mark Attendance</button>
+    </form>
+
+    <script>
+        // Mocking a dynamic token that would normally be scanned from the projector screen
+        const MOCK_CHALLENGE_FROM_QR = "classroom_session_challenge_xyz123";
+
+        function updateStatus(msg, color = "black") {
+            const box = document.getElementById("status-box");
+            box.innerText = "Status: " + msg;
+            box.style.color = color;
+        }
+
+        async function startCheckIn() {
+            const roll = document.getElementById('roll').value;
+            if (!roll) {
+                alert("Please enter your roll number first.");
+                return;
+            }
+
+            updateStatus("Measuring network latency via WebSocket...", "blue");
+
+            // 1. Open WebSocket to measure local Hotspot Round-Trip-Time (RTT)
+            // It automatically figures out the server host IP from the current URL address
+            const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+            const wsUrl = `${wsProtocol}//${window.location.host}/ws/latency`;
+            const socket = new WebSocket(wsUrl);
+
+            let measuredRTT = 999.0;
+
+            socket.onmessage = async (event) => {
+                const data = JSON.parse(event.data);
+
+                if (data.type === "ping") {
+                    // Echo back immediately to measure transit delay
+                    socket.send(JSON.stringify({ type: "pong" }));
+                } 
+                else if (data.type === "latency_result") {
+                    measuredRTT = data.rtt_ms;
+                    updateStatus(`Latency Verified (${measuredRTT.toFixed(2)}ms). Accessing hardware keys...`, "blue");
+                    
+                    // Proceed to step 2: Cryptographic signature processing
+                    await proceedToSignature(roll, measuredRTT);
+                }
+            };
+
+            socket.onerror = (err) => {
+                updateStatus("Network connection failed. Are you connected to the Instructor's Hotspot?", "red");
+            };
+        }
+
+        async function proceedToSignature(roll, rtt) {
+            // 2. Open IndexedDB and fetch the hidden private key generated on Day 1
+            const openRequest = indexedDB.open("LocalDeviceAuth", 1);
+            
+            openRequest.onsuccess = async () => {
+                const db = openRequest.result;
+                const transaction = db.transaction("keys", "readonly");
+                const store = transaction.objectStore("keys");
+                const getPrivateKey = store.get("sk");
+
+                getPrivateKey.onsuccess = async () => {
+                    const privateKey = getPrivateKey.result;
+
+                    if (!privateKey) {
+                        updateStatus("Device Signature Missing! Have you registered this device yet?", "red");
+                        return;
+                    }
+
+                    updateStatus("Signing security challenge...", "blue");
+
+                    // 3. Cryptographically sign the classroom challenge using the local hardware key
+                    const encoder = new TextEncoder();
+                    const challengeBuffer = encoder.encode(MOCK_CHALLENGE_FROM_QR);
+                    
+                    const signatureBuffer = await window.crypto.subtle.sign(
+                        { name: "RSASSA-PKCS1-v1_5" },
+                        privateKey,
+                        challengeBuffer
+                    );
+
+                    // Convert binary signature array buffer to a hex string for transfer
+                    const signatureHex = Array.prototype.map.call(new Uint8Array(signatureBuffer), x => ('0' + x.toString(16)).slice(-2)).join('');
+
+                    // 4. Send telemetry and signature block back to the Python backend agent
+                    await submitCheckInData(roll, signatureHex, MOCK_CHALLENGE_FROM_QR, rtt);
+                };
+            };
+        }
+
+        async function submitCheckInData(roll, signatureHex, challenge, rtt) {
+            updateStatus("Submitting security packet to backend agent...", "blue");
+
+            const formData = new FormData();
+            formData.append("roll_number", roll);
+            formData.append("signature_hex", signatureHex);
+            formData.append("original_challenge", challenge);
+            formData.append("current_rtt", rtt);
+
+            try {
+                const res = await fetch("/api/checkin", { method: "POST", body: formData });
+                const result = await res.json();
+
+                if (result.status === "success") {
+                    updateStatus("✅ " + result.message, "green");
+                } else if (result.status === "fraud") {
+                    updateStatus("❌ Fraud Alert: " + result.reason, "red");
+                } else {
+                    updateStatus("⚠️ Error: " + result.reason, "orange");
+                }
+            } catch (err) {
+                updateStatus("Failed to communicate verification packet to local server.", "red");
+            }
+        }
+    </script>
+</body>
+</html>
