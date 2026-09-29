@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>AirGated - Classroom Network</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 16px; background: #fafafa; color: #333; }
+        .card { max-width: 420px; background: white; padding: 24px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); margin: 16px auto; border-top: 4px solid #7928ca; }
+        h2 { margin-top: 0; color: #111; text-align: center; }
+        p, li { color: #555; font-size: 0.92em; line-height: 1.5; }
+        .url { display: block; padding: 12px; background: #f4f4f5; border-radius: 8px; font-family: monospace; text-align: center; word-break: break-all; margin: 12px 0; user-select: all; }
+        a.btn { display: block; text-align: center; padding: 14px; background: #7928ca; color: white; text-decoration: none; border-radius: 8px; font-weight: 600; margin-top: 12px; }
+        a.secondary { background: #52525b; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>AirGated Classroom Network</h2>
+        <p>Attendance uses your camera and a device key, which only work on the secure page in a full browser (not inside this sign-in window).</p>
+        <ol>
+            <li>Open <strong>Chrome</strong> or <strong>Safari</strong>.</li>
+            <li>Go to:<span class="url">https://{{LOCAL_IP}}/generate-captive-window</span></li>
+        </ol>
+        <a class="btn" href="https://{{LOCAL_IP}}/generate-captive-window" target="_blank" rel="noopener">Open secure check-in</a>
+        <p style="margin-top:20px">First time? Install the classroom certificate once so your browser stops showing a security warning:</p>
+        <a class="btn secondary" href="/airgated-ca.crt">Download classroom certificate</a>
+    </div>
+</body>
+</html>

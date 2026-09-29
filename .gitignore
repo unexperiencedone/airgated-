@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 ssl_certs/
 .env
+.venv/
+.pytest_cache/
+models/
+evidence/
+database.db

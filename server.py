@@ -1,7 +1,12 @@
 import sys
 import asyncio
+import hashlib
+import html
 import logging
+import random
+import secrets
 import sqlite3
+import statistics
 import time
 import subprocess
 import markdown
@@ -11,14 +16,20 @@ import socket
 import threading
 import httpx
 import os
-from dotenv import load_dotenv
+from contextlib import closing
+from dataclasses import dataclass
 
-load_dotenv()
-from fastapi import FastAPI, WebSocket, Request, Form, BackgroundTasks, Response
-from fastapi.responses import HTMLResponse, FileResponse
+from dotenv import load_dotenv
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, File, UploadFile, BackgroundTasks, Response
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, PlainTextResponse
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import load_der_public_key
+
+import face_verify
+
+load_dotenv()
 
 # Silencing low-level transport framework exceptions from cluttering terminal
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
@@ -39,20 +50,93 @@ if sys.platform == "win32":
 app = FastAPI()
 exam_cache = {}
 
-# --- LOCAL NETWORK PORT ARCHITECTURE INTERFACES ---
-LOCAL_IP = "192.168.137.1"  # Hotspot Gateway IP
-DNS_PORT = 53
-WEB_PORT = 443  # Force full SSL Context pipeline tracking
-HTTP_DETECT_PORT = 80  # Plain-HTTP responder so OS captive-portal probes actually get an answer
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
+SSL_DIR = os.path.join(BASE_DIR, "ssl_certs")
+EVIDENCE_DIR = os.path.join(BASE_DIR, "evidence")
+DB_PATH = os.environ.get("AIRGATED_DB", os.path.join(BASE_DIR, "database.db"))
 
-# Domains phones/OSes use to silently check "do I have real internet". Shared by both
-# the HTTP detection listener and the HTTPS catch-all so they answer identically.
-SYSTEM_TELEMETRY_ENDPOINTS = [
-    "generate_204", "gen_204", "connectivitycheck", "ncsi", "connecttest", "success.txt"
-]
+# --- LOCAL NETWORK PORT ARCHITECTURE INTERFACES ---
+LOCAL_IP = os.environ.get("AIRGATED_LOCAL_IP", "192.168.137.1")  # Hotspot Gateway IP
+DNS_PORT = 53
+WEB_PORT = 443
+HTTP_DETECT_PORT = 80  # Plain-HTTP responder so OS captive-portal probes actually get an answer
+LOOPBACK_HOSTS = ("127.0.0.1", "::1")
+
+# --- VERIFICATION POLICY ---
+RTT_THRESHOLD_MS = 20.0
+RTT_PING_COUNT = 5
+CHALLENGE_TTL_SECONDS = 120
+CAPTURE_MS = 5000
+BLINK_CHOICES = (2, 3)
+MAX_FRAMES = 120
+MAX_FRAME_BYTES = 300_000
+MULTI_PROFILE_WINDOW_SECONDS = 60.0
+VERIFIED_CLIENT_SECONDS = 3 * 3600
 
 CLOUD_LLM_URL = "https://api.groq.com/openai/v1/chat/completions"
 CLOUD_API_KEY = os.environ.get("GROQ_API_KEY", "")
+
+
+# --- CAPTIVE-PORTAL CONNECTIVITY PROBES ---
+# Phones/OSes fetch these over plain HTTP to decide "is there real internet here?". The answer
+# must depend on whether this client has checked in yet:
+#   * not yet verified -> redirect to the portal. This is what makes the OS raise its native
+#     "Sign in to network" popup. Answering 204 here (what the previous listener did) tells the
+#     OS the network is already open, so the popup never appears (Finding 4.2b).
+#   * verified         -> the exact "success" body each OS expects, so the Wi-Fi is marked as
+#     validated and keeps passing the OS's periodic re-checks (Scenario 3).
+PROBE_SUCCESS_RESPONSES = {
+    "generate_204": (204, ""),
+    "gen_204": (204, ""),
+    "hotspot-detect.html": (200, "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>"),
+    "library/test/success.html": (200, "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>"),
+    "connecttest.txt": (200, "Microsoft Connect Test"),
+    "ncsi.txt": (200, "Microsoft NCSI"),
+    "success.txt": (200, "success\n"),
+    "canonical.html": (200, '<meta http-equiv="refresh" content="0;url=https://support.mozilla.org/kb/captive-portal"/>'),
+}
+
+# client IP -> expiry timestamp; populated by a successful check-in
+VERIFIED_CLIENTS = {}
+
+
+def is_client_verified(client_ip):
+    expiry = VERIFIED_CLIENTS.get(client_ip)
+    return expiry is not None and expiry > time.time()
+
+
+def match_connectivity_probe(path_name):
+    path = path_name.lower().strip("/")
+    for suffix, answer in PROBE_SUCCESS_RESPONSES.items():
+        if path == suffix or path.endswith("/" + suffix):
+            return answer
+    return None
+
+
+def probe_response(path_name, client_ip, portal_url):
+    """Response for a connectivity probe, or None if the path isn't one."""
+    answer = match_connectivity_probe(path_name)
+    if answer is None:
+        return None
+    if not is_client_verified(client_ip):
+        return RedirectResponse(portal_url, status_code=302)
+    status, body = answer
+    if status == 204:
+        return Response(status_code=204)
+    return HTMLResponse(body, status_code=status)
+
+
+def load_template(name):
+    with open(os.path.join(TEMPLATES_DIR, name), encoding="utf-8") as f:
+        return f.read().replace("{{LOCAL_IP}}", LOCAL_IP)
+
+
+def ca_cert_response():
+    ca_path = os.path.join(SSL_DIR, "ca.crt")
+    if not os.path.exists(ca_path):
+        return PlainTextResponse("Certificate not generated yet.", status_code=404)
+    return FileResponse(ca_path, media_type="application/x-x509-ca-cert", filename="airgated-ca.crt")
 
 
 # --- BACKGROUND WORKER: DNS SPOOFER LAYER ---
@@ -77,7 +161,7 @@ def run_dns_spoofer():
             request = DNSRecord.parse(data)
             reply = request.reply()
             qname = request.q.qname
-            
+
             reply.add_answer(RR(qname, rdata=A(LOCAL_IP), ttl=60))
             udps.sendto(reply.pack(), addr)
         except socket.error:
@@ -88,28 +172,39 @@ def run_dns_spoofer():
 
 # --- BACKGROUND WORKER: PLAIN-HTTP CAPTIVE-PORTAL DETECTION LISTENER ---
 # Android/iOS run their captive-portal connectivity probe over plain HTTP by design, so a
-# broken/self-signed TLS cert on the real (443) server can't interfere with detection. Without
-# something answering on port 80, that probe gets a connection refusal, which the OS reads as
-# "no network" rather than "captive portal present" -- so the native sign-in popup never launches.
-# This listener's only job is to give that probe a real HTTP response and hand everything else
-# off to the existing HTTPS pipeline; it does not touch registration, signing, or fraud checks.
-def run_http_redirect_server():
-    from fastapi import FastAPI as _FastAPI, Response as _Response
+# broken/self-signed TLS cert on the real (443) server can't interfere with detection. This
+# listener answers those probes (see probe_response), serves the landing page shown inside the
+# OS sign-in popup, and offers the classroom CA certificate for one-time install. The popup's
+# embedded browser usually can't use the camera, so the landing page sends students to the
+# HTTPS portal in their real browser.
+def build_http_app():
+    from fastapi import FastAPI as _FastAPI
 
     http_app = _FastAPI()
+    landing_url = f"http://{LOCAL_IP}/welcome"
+
+    @http_app.get("/welcome", response_class=HTMLResponse)
+    async def landing_page():
+        return HTMLResponse(load_template("landing.html"))
+
+    @http_app.get("/airgated-ca.crt")
+    async def http_ca_cert():
+        return ca_cert_response()
 
     @http_app.api_route("/{path_name:path}", methods=["GET", "POST", "HEAD"])
-    async def http_catch_all(path_name: str, response: _Response):
-        if any(endpoint in path_name.lower() for endpoint in SYSTEM_TELEMETRY_ENDPOINTS):
-            response.status_code = 204
-            return response
-        response.headers["Location"] = f"https://{LOCAL_IP}:{WEB_PORT}/generate-captive-window"
-        response.status_code = 302
-        return response
+    async def http_catch_all(path_name: str, request: Request):
+        probe = probe_response(path_name, request.client.host, landing_url)
+        if probe is not None:
+            return probe
+        return RedirectResponse(landing_url, status_code=302)
 
+    return http_app
+
+
+def run_http_redirect_server():
     async def _serve():
         import uvicorn
-        config = uvicorn.Config(http_app, host="0.0.0.0", port=HTTP_DETECT_PORT, log_level="warning")
+        config = uvicorn.Config(build_http_app(), host="0.0.0.0", port=HTTP_DETECT_PORT, log_level="warning")
         server = uvicorn.Server(config)
         await server.serve()
 
@@ -137,358 +232,452 @@ def get_client_mac(client_ip: str) -> str:
     return "unknown_mac"
 
 
+def db_connect():
+    return closing(sqlite3.connect(DB_PATH))
+
+
+def _add_missing_columns(cursor, table, columns):
+    existing = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}
+    for name, decl in columns.items():
+        if name not in existing:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
 def init_db():
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS airgated_device_registry (
-            roll_number TEXT PRIMARY KEY,
-            name TEXT,
-            public_key_hex TEXT,
-            hardware_mac TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS airgated_attendance_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            roll_number TEXT,
-            timestamp REAL,
-            latency_ms REAL,
-            network_ip TEXT,  
-            network_mac TEXT   
-        )
-    """)
-    conn.commit()
-    conn.close()
+    with db_connect() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS airgated_device_registry (
+                roll_number TEXT PRIMARY KEY,
+                name TEXT,
+                public_key_hex TEXT,
+                hardware_mac TEXT
+            )
+        """)
+        _add_missing_columns(cursor, "airgated_device_registry", {
+            "face_embedding": "BLOB",
+            "enrolled_at": "REAL",
+        })
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS airgated_attendance_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                roll_number TEXT,
+                timestamp REAL,
+                latency_ms REAL,
+                network_ip TEXT,
+                network_mac TEXT
+            )
+        """)
+        _add_missing_columns(cursor, "airgated_attendance_records", {
+            "face_similarity": "REAL",
+            "blinks_detected": "INTEGER",
+            "evidence_file": "TEXT",
+        })
+        # Persistent record of every rejected or security-relevant event, reviewable at /admin.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS airgated_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL,
+                event TEXT,
+                roll_number TEXT,
+                network_ip TEXT,
+                network_mac TEXT,
+                detail TEXT
+            )
+        """)
+        conn.commit()
 
 init_db()
+
+
+def audit(event, roll_number, client_ip, mac, detail):
+    print(f"🚨 [Audit:{event}] Roll: {roll_number} | IP: {client_ip} | MAC: {mac} | {detail}")
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO airgated_audit_log (timestamp, event, roll_number, network_ip, network_mac, detail) VALUES (?, ?, ?, ?, ?, ?)",
+            (time.time(), event, roll_number, client_ip, mac, detail),
+        )
+        conn.commit()
+
+
+# --- SERVER-ISSUED SINGLE-USE CHALLENGES ---
+# Every registration and check-in must sign a nonce the server just issued over the challenge
+# WebSocket. The nonce is bound to the purpose, roll number and client IP, carries the RTT the
+# server itself measured, expires after CHALLENGE_TTL_SECONDS, and is deleted on first use --
+# so a captured signature can never be replayed (Section 5 of the progress report).
+@dataclass
+class Challenge:
+    purpose: str
+    roll_number: str
+    client_ip: str
+    rtt_ms: float
+    blinks_required: int
+    issued_at: float
+
+
+CHALLENGES = {}
+
+
+def issue_challenge(purpose, roll_number, client_ip, rtt_ms):
+    now = time.time()
+    for nonce in [n for n, c in CHALLENGES.items() if now - c.issued_at > CHALLENGE_TTL_SECONDS]:
+        del CHALLENGES[nonce]
+    nonce = secrets.token_hex(16)
+    CHALLENGES[nonce] = Challenge(purpose, roll_number, client_ip, rtt_ms, random.choice(BLINK_CHOICES), now)
+    return nonce, CHALLENGES[nonce]
+
+
+def consume_challenge(nonce, purpose, roll_number, client_ip):
+    """Pop the challenge (single use) and return (challenge, error_message)."""
+    challenge = CHALLENGES.pop(nonce, None)
+    if challenge is None:
+        return None, "Challenge unknown or already used. Start again."
+    if time.time() - challenge.issued_at > CHALLENGE_TTL_SECONDS:
+        return None, "Challenge expired. Start again."
+    if (challenge.purpose, challenge.roll_number, challenge.client_ip) != (purpose, roll_number, client_ip):
+        return None, "Challenge was issued for a different request."
+    return challenge, None
+
+
+def signed_message(purpose, nonce, roll_number, frames):
+    frames_hash = hashlib.sha256(b"".join(frames)).hexdigest()
+    return f"airgated|{purpose}|{nonce}|{roll_number}|{frames_hash}".encode()
+
+
+def signature_valid(public_key_hex, signature_hex, message):
+    try:
+        public_key = load_der_public_key(bytes.fromhex(public_key_hex))
+        public_key.verify(bytes.fromhex(signature_hex), message, padding.PKCS1v15(), hashes.SHA256())
+        return True
+    except Exception:
+        return False
+
+
+async def read_frames(frames):
+    if not frames or len(frames) > MAX_FRAMES:
+        return None, f"Expected between 1 and {MAX_FRAMES} camera frames."
+    blobs = []
+    for upload in frames:
+        blob = await upload.read(MAX_FRAME_BYTES + 1)
+        if len(blob) > MAX_FRAME_BYTES:
+            return None, "Camera frame too large."
+        blobs.append(blob)
+    return blobs, None
+
+
+async def analyze_face(frames):
+    try:
+        return await run_in_threadpool(face_verify.analyze, frames), None
+    except RuntimeError as e:
+        return None, f"Face verification unavailable on server: {e}"
+
+
+def save_evidence(roll_number, jpeg):
+    if not jpeg:
+        return None
+    os.makedirs(EVIDENCE_DIR, exist_ok=True)
+    safe_roll = re.sub(r"[^A-Za-z0-9_-]", "_", roll_number)
+    filename = f"{safe_roll}_{int(time.time())}.jpg"
+    with open(os.path.join(EVIDENCE_DIR, filename), "wb") as f:
+        f.write(jpeg)
+    return filename
 
 
 # --- MODULE 1 SECURE LAYOUT CAPTIVE PORTAL INTERFACE ---
 @app.get("/generate-captive-window", response_class=HTMLResponse)
 async def captive_portal_window():
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>AirGated - Verification Gate</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 20px; background: #fafafa; color: #333; }
-            .container { max-width: 400px; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); margin: 20px auto; }
-            #checkin-box { border-top: 4px solid #7928ca; }
-            #register-box { border-top: 4px solid #0070f3; display: none; }
-            h2 { margin-top: 0; color: #111; font-size: 1.5em; text-align: center; }
-            p { color: #666; font-size: 0.9em; line-height: 1.5; text-align: center; margin-bottom: 25px; }
-            label { font-weight: 600; font-size: 0.85em; color: #444; display: block; margin-bottom: 5px; }
-            input { width: 100%; padding: 12px; margin-bottom: 20px; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; font-size: 1em; background: #fdfdfd; }
-            button { width: 100%; padding: 14px; color: white; border: none; border-radius: 8px; font-size: 1em; font-weight: 600; cursor: pointer; width: 100%; }
-            .btn-checkin { background: #7928ca; }
-            .btn-register { background: #0070f3; }
-            button:disabled { background: #ccc; cursor: not-allowed; }
-            .status-msg { margin-bottom: 20px; padding: 12px; background: #f4f4f5; border-radius: 8px; font-weight: 500; font-size: 0.9em; border: 1px solid #e4e4e7; text-align: center;}
-            #debug-log { margin-top: 20px; white-space: pre-wrap; font-family: monospace; font-size: 0.85em; color: #555; background: #f3f3f3; padding: 12px; border-radius: 8px; display: none; border: 1px solid #e4e4e7; }
-        </style>
-    </head>
-    <body>
-
-        <div id="checkin-box" class="container">
-            <h2>Classroom Authentication</h2>
-            <div id="status-box" class="status-msg">Status: Verifying local node token data...</div>
-            <form id="checkinForm" onsubmit="return false;">
-                <label>University Roll Number</label>
-                <input type="text" id="roll" placeholder="Enter Registered Roll Number" required>
-                <button type="button" class="btn-checkin" id="scanBtn" onclick="startCheckIn()">Mark Presence</button>
-            </form>
-        </div>
-
-        <div id="register-box" class="container">
-            <h2>Enroll Identity (Day 1)</h2>
-            <p>No valid cryptographic anchor found. Please register this physical hardware profile.</p>
-            <form id="regForm" onsubmit="return false;">
-                <label>Roll Number</label>
-                <input type="text" id="reg-roll" placeholder="e.g., CSJMA24001390" required>
-                <label>Full Name</label>
-                <input type="text" id="reg-name" placeholder="e.g., David Dhawan" required>
-                <button type="button" class="btn-register" id="regBtn" onclick="handleRegistration()">Register Hardware Anchor</button>
-            </form>
-            <div id="debug-log"></div>
-        </div>
-
-        <script>
-            const MOCK_CHALLENGE_FROM_QR = "classroom_session_challenge_xyz123";
-
-            // SECURITY: private key lives only as a non-extractable CryptoKey inside IndexedDB.
-            // It is never exported to bytes and never touches localStorage, so it cannot be copied
-            // to a second device the way a base64-exported key could be (see Finding 4.1).
-            function openKeyDB() {
-                return new Promise((resolve, reject) => {
-                    const req = indexedDB.open("LocalDeviceAuth", 1);
-                    req.onupgradeneeded = () => { req.result.createObjectStore("keys"); };
-                    req.onsuccess = () => resolve(req.result);
-                    req.onerror = () => reject(req.error);
-                });
-            }
-
-            async function getStoredPrivateKey() {
-                const db = await openKeyDB();
-                return new Promise((resolve, reject) => {
-                    const tx = db.transaction("keys", "readonly");
-                    const getReq = tx.objectStore("keys").get("sk");
-                    getReq.onsuccess = () => resolve(getReq.result || null);
-                    getReq.onerror = () => reject(getReq.error);
-                });
-            }
-
-            async function savePrivateKey(cryptoKey) {
-                const db = await openKeyDB();
-                return new Promise((resolve, reject) => {
-                    const tx = db.transaction("keys", "readwrite");
-                    tx.objectStore("keys").put(cryptoKey, "sk");
-                    tx.oncomplete = () => resolve();
-                    tx.onerror = () => reject(tx.error);
-                });
-            }
-
-            window.onload = async function() {
-                try {
-                    const storedKey = await getStoredPrivateKey();
-                    if (!storedKey) {
-                        document.getElementById("checkin-box").style.display = "none";
-                        document.getElementById("register-box").style.display = "block";
-                    } else {
-                        document.getElementById("status-box").innerText = "Status: Device anchored. Ready to verify.";
-                    }
-                } catch (e) {
-                    document.getElementById("checkin-box").style.display = "none";
-                    document.getElementById("register-box").style.display = "block";
-                }
-            };
-
-            function updateStatus(msg, color = "black") {
-                const box = document.getElementById("status-box");
-                box.innerText = "Status: " + msg; box.style.color = color;
-            }
-
-            function logStatus(msg) {
-                const logDiv = document.getElementById('debug-log');
-                logDiv.style.display = "block";
-                logDiv.innerText += "\\n> " + msg;
-            }
-
-            function arrayBufferToBase64(buffer) {
-                var binary = ''; var bytes = new Uint8Array(buffer);
-                for (var i = 0; i < bytes.byteLength; i++) { binary += String.fromCharCode(bytes[i]); }
-                return window.btoa(binary);
-            }
-
-            function base64ToUint8Array(base64) {
-                var binary_string = window.atob(base64);
-                var bytes = new Uint8Array(binary_string.length);
-                for (var i = 0; i < binary_string.length; i++) { bytes[i] = binary_string.charCodeAt(i); }
-                return bytes;
-            }
-
-            async function startCheckIn() {
-                const roll = document.getElementById('roll').value.trim();
-                if (!roll) { alert("Roll Number required."); return; }
-                updateStatus("Evaluating link speed via WebSocket...", "blue");
-
-                const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-                const socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws/latency`);
-                let measuredRTT = 999.0;
-
-                socket.onmessage = async (event) => {
-                    const data = JSON.parse(event.data);
-                    if (data.type === "ping") { socket.send(JSON.stringify({ type: "pong" })); } 
-                    else if (data.type === "latency_result") {
-                        measuredRTT = data.rtt_ms;
-                        updateStatus(`Proximity Verified (${measuredRTT.toFixed(2)}ms). Fetching token...`, "blue");
-                        await executeSignature(roll, measuredRTT);
-                    }
-                };
-            }
-
-            async function executeSignature(roll, rtt) {
-                try {
-                    updateStatus("Signing temporary session token...", "blue");
-
-                    const privateKey = await getStoredPrivateKey();
-                    if (!privateKey) {
-                        updateStatus("❌ Device Signature Missing! Have you registered this device yet?", "red");
-                        return;
-                    }
-                    const signatureBuffer = await window.crypto.subtle.sign(
-                        { name: "RSASSA-PKCS1-v1_5" }, privateKey, new TextEncoder().encode(MOCK_CHALLENGE_FROM_QR)
-                    );
-                    const signatureHex = Array.prototype.map.call(new Uint8Array(signatureBuffer), x => ('0' + x.toString(16)).slice(-2)).join('');
-
-                    updateStatus("Transmitting verification signatures...", "blue");
-                    const formData = new FormData();
-                    formData.append("roll_number", roll);
-                    formData.append("signature_hex", signatureHex);
-                    formData.append("original_challenge", MOCK_CHALLENGE_FROM_QR);
-                    formData.append("current_rtt", rtt);
-
-                    // FIXED: Force reference route directly to relative paths to keep within SSL context boundaries
-                    const res = await fetch("/api/checkin", { method: "POST", body: formData });
-                    const result = await res.json();
-
-                    if (result.status === "success") updateStatus("✅ " + result.message, "green");
-                    else updateStatus("❌ " + result.reason, "red");
-                } catch (err) { updateStatus("❌ Signature Error: " + err.message, "red"); }
-            }
-
-            async function handleRegistration() {
-                document.getElementById('debug-log').innerText = "";
-                const roll = document.getElementById('reg-roll').value.trim();
-                const name = document.getElementById('reg-name').value.trim();
-                if (!roll || !name) { alert("Please complete all profile fields."); return; }
-
-                document.getElementById('regBtn').disabled = true;
-                try {
-                    logStatus("Generating asymmetric cryptographic anchor...");
-                    const keyPair = await window.crypto.subtle.generateKey(
-                        { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
-                        false, ["sign", "verify"]
-                    );
-
-                    logStatus("Locking private key to non-extractable IndexedDB storage...");
-                    await savePrivateKey(keyPair.privateKey);
-                    logStatus("Private identity token locked to this device. It cannot be exported or copied.");
-
-                    const exportedPub = await window.crypto.subtle.exportKey("spki", keyPair.publicKey);
-                    const pubHex = Array.prototype.map.call(new Uint8Array(exportedPub), x => ('0' + x.toString(16)).slice(-2)).join('');
-                    
-                    const formData = new FormData();
-                    formData.append("roll_number", roll);
-                    formData.append("name", name);
-                    formData.append("public_key", pubHex);
-
-                    // FIXED: Relative endpoint formatting preserves headers cleanly over HTTPS port map boundaries
-                    const res = await fetch("/api/register", { method: "POST", body: formData });
-                    const data = await res.json();
-                    
-                    logStatus("Gateway Response: " + JSON.stringify(data));
-                    alert(data.message);
-                    
-                    document.getElementById("register-box").style.display = "none";
-                    document.getElementById("checkin-box").style.display = "block";
-                    document.getElementById("roll").value = roll;
-                    updateStatus("Device link compiled! Ready to verify attendance.", "green");
-                } catch (error) {
-                    logStatus("❌ ERROR: " + error.message);
-                    document.getElementById('regBtn').disabled = false;
-                }
-            }
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content, status_code=200)
+    return HTMLResponse(content=load_template("portal.html"), status_code=200)
 
 
-# --- API ENDPOINT: REGISTRATION & AUTO-RESET OVERRIDE ---
+@app.get("/airgated-ca.crt")
+async def https_ca_cert():
+    return ca_cert_response()
+
+
+# --- WEBSOCKET: SERVER-MEASURED PROXIMITY + CHALLENGE ISSUANCE ---
+# The server times several ping/pong round trips itself and keeps the median, so the RTT used
+# by the latency gate is never a number the client reports.
+@app.websocket("/ws/challenge")
+async def websocket_challenge_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    purpose = websocket.query_params.get("purpose", "")
+    roll_number = websocket.query_params.get("roll", "").strip()
+    client_ip = websocket.client.host
+    try:
+        if purpose not in ("register", "checkin") or not roll_number:
+            await websocket.send_json({"type": "error", "reason": "Bad challenge request."})
+            await websocket.close()
+            return
+
+        samples = []
+        for _ in range(RTT_PING_COUNT):
+            start = time.perf_counter()
+            await websocket.send_json({"type": "ping"})
+            await websocket.receive_json()
+            samples.append((time.perf_counter() - start) * 1000)
+        rtt_ms = statistics.median(samples)
+
+        if purpose == "checkin" and rtt_ms > RTT_THRESHOLD_MS:
+            audit("latency_gate", roll_number, client_ip, None, f"median RTT {rtt_ms:.1f}ms > {RTT_THRESHOLD_MS}ms")
+            await websocket.send_json({"type": "error", "reason": "Network latency too high. Connect directly to the classroom Wi-Fi."})
+            await websocket.close()
+            return
+
+        nonce, challenge = issue_challenge(purpose, roll_number, client_ip, rtt_ms)
+        await websocket.send_json({
+            "type": "challenge",
+            "nonce": nonce,
+            "blinks_required": challenge.blinks_required,
+            "capture_ms": CAPTURE_MS,
+            "rtt_ms": rtt_ms,
+            "expires_in": CHALLENGE_TTL_SECONDS,
+        })
+        await websocket.close()
+    except WebSocketDisconnect:
+        pass
+
+
+# --- API ENDPOINT: KYC ENROLLMENT (device key + face) ---
 @app.post("/api/register")
-async def register_student(request: Request, roll_number: str = Form(...), name: str = Form(...), public_key: str = Form(...)):
+async def register_student(
+    request: Request,
+    roll_number: str = Form(...),
+    name: str = Form(...),
+    public_key: str = Form(...),
+    nonce: str = Form(...),
+    signature_hex: str = Form(...),
+    frames: list[UploadFile] = File(...),
+):
+    roll_number, name = roll_number.strip(), name.strip()
     client_ip = request.client.host
     hardware_mac = get_client_mac(client_ip)
     print(f"📥 [Register Request] Roll: {roll_number} | IP: {client_ip} | MAC: {hardware_mac}")
 
-    if hardware_mac == "unknown_mac" and client_ip != "127.0.0.1":
+    challenge, error = consume_challenge(nonce, "register", roll_number, client_ip)
+    if error:
+        audit("register_bad_challenge", roll_number, client_ip, hardware_mac, error)
+        return {"status": "error", "message": error}
+
+    if hardware_mac == "unknown_mac" and client_ip not in LOOPBACK_HOSTS:
         return {"status": "error", "message": "Could not extract physical MAC signature. Reconnect to class network."}
 
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    try:
-        cursor.execute("SELECT roll_number, name FROM airgated_device_registry WHERE hardware_mac = ?", (hardware_mac,))
-        existing_device = cursor.fetchone()
-        
-        if existing_device:
-            existing_roll, existing_name = existing_device
-            print(f"🔄 [Auto-Reset Triggered] MAC {hardware_mac} matches profile ({existing_roll}). Overwriting keys...")
+    blobs, error = await read_frames(frames)
+    if error:
+        return {"status": "error", "message": error}
+
+    # Proof of possession: the new key must have signed this nonce and these exact frames.
+    if not signature_valid(public_key, signature_hex, signed_message("register", nonce, roll_number, blobs)):
+        audit("register_bad_signature", roll_number, client_ip, hardware_mac, "signature did not verify against submitted key")
+        return {"status": "error", "message": "Device key signature invalid."}
+
+    analysis, error = await analyze_face(blobs)
+    if error:
+        return {"status": "error", "message": error}
+    failure = analysis.liveness_failure(challenge.blinks_required)
+    if failure:
+        audit("register_liveness_failed", roll_number, client_ip, hardware_mac, failure)
+        return {"status": "error", "message": failure}
+
+    with db_connect() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT roll_number FROM airgated_device_registry WHERE hardware_mac = ? AND roll_number != ?",
+            (hardware_mac, roll_number),
+        )
+        other = cursor.fetchone()
+        if other and hardware_mac != "unknown_mac":
+            audit("register_device_taken", roll_number, client_ip, hardware_mac, f"device already enrolled as {other[0]}")
+            return {"status": "error", "message": "This device is already enrolled to another roll number. Ask the instructor to reset it."}
+
+        cursor.execute(
+            "SELECT hardware_mac, face_embedding FROM airgated_device_registry WHERE roll_number = ?",
+            (roll_number,),
+        )
+        existing = cursor.fetchone()
+        embedding = face_verify.embedding_to_bytes(analysis.embedding)
+
+        if existing is None:
             cursor.execute(
-                "UPDATE airgated_device_registry SET public_key_hex = ?, roll_number = ?, name = ? WHERE hardware_mac = ?",
-                (public_key, roll_number, name, hardware_mac)
+                "INSERT INTO airgated_device_registry (roll_number, name, public_key_hex, hardware_mac, face_embedding, enrolled_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (roll_number, name, public_key, hardware_mac, embedding, time.time()),
             )
             conn.commit()
-            return {"status": "success", "message": "Cache clear detected! Your device link has been auto-recovered successfully."}
+            print(f"✅ [Enrolled] Roll: {roll_number} | MAC: {hardware_mac}")
+            return {"status": "success", "message": "Device and face enrolled successfully!"}
 
-        cursor.execute("INSERT INTO airgated_device_registry VALUES(?, ?, ?, ?)", (roll_number, name, public_key, hardware_mac))
+        registered_mac, enrolled_face = existing
+        if enrolled_face is not None:
+            # Re-enrollment (cleared browser data, new phone, randomized MAC): the enrolled face
+            # is the proof of identity, replacing the old silent "trust whoever has this MAC" reset.
+            score = face_verify.similarity(face_verify.embedding_from_bytes(enrolled_face), analysis.embedding)
+            if score < face_verify.MATCH_THRESHOLD:
+                audit("reenroll_face_mismatch", roll_number, client_ip, hardware_mac, f"similarity {score:.3f}")
+                return {"status": "error", "message": "Face does not match the student enrolled under this roll number."}
+            cursor.execute(
+                "UPDATE airgated_device_registry SET public_key_hex = ?, hardware_mac = ? WHERE roll_number = ?",
+                (public_key, hardware_mac, roll_number),
+            )
+            conn.commit()
+            audit("reenroll_device", roll_number, client_ip, hardware_mac, f"face match {score:.3f}; previous MAC {registered_mac}")
+            return {"status": "success", "message": "Face matched. This device is now your enrolled device."}
+
+        # Enrolled before face verification existed: only the original device may add a face.
+        if registered_mac != hardware_mac and client_ip not in LOOPBACK_HOSTS:
+            audit("legacy_upgrade_refused", roll_number, client_ip, hardware_mac, f"registered MAC {registered_mac}")
+            return {"status": "error", "message": "Roll number already enrolled from another device. Ask the instructor to reset it."}
+        cursor.execute(
+            "UPDATE airgated_device_registry SET public_key_hex = ?, face_embedding = ?, enrolled_at = ? WHERE roll_number = ?",
+            (public_key, embedding, time.time(), roll_number),
+        )
         conn.commit()
-        return {"status": "success", "message": "Device registered successfully!"}
-    except Exception as e:
-        return {"status": "error", "message": f"SQLite Execution Failure: {str(e)}"}
-    finally:
-        conn.close()
-
-
-# --- WEBSOCKET REAL-TIME PROXIMITY CHANNEL ---
-@app.websocket("/ws/latency")
-async def websocket_latency_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    for _ in range(3):
-        start_time = time.time()
-        await websocket.send_json({"type": "ping"})
-        await websocket.receive_json()
-        end_time = time.time()
-    rtt_ms = (end_time - start_time) * 1000
-    await websocket.send_json({"type": "latency_result", "rtt_ms": rtt_ms})
-    await websocket.close()
+        audit("legacy_face_added", roll_number, client_ip, hardware_mac, "face added to pre-existing enrollment")
+        return {"status": "success", "message": "Face added to your existing enrollment."}
 
 
 # --- VALIDATION ATTENDANCE ENGINE ENTRYPOINT ---
 @app.post("/api/checkin")
-async def verify_checkin(request: Request, roll_number: str = Form(...), signature_hex: str = Form(...), original_challenge: str = Form(...), current_rtt: float = Form(...)):
+async def verify_checkin(
+    request: Request,
+    roll_number: str = Form(...),
+    nonce: str = Form(...),
+    signature_hex: str = Form(...),
+    frames: list[UploadFile] = File(...),
+):
+    roll_number = roll_number.strip()
     client_ip = request.client.host
     incoming_mac = get_client_mac(client_ip)
-    print(f"📥 [Checkin Verification] Evaluating signature for Roll: {roll_number} | RTT: {current_rtt}ms")
+    print(f"📥 [Checkin Verification] Roll: {roll_number} | IP: {client_ip} | MAC: {incoming_mac}")
 
-    if current_rtt > 20.0:
-        print(f"🚫 [Checkin Rejected] Roll: {roll_number} | Reason: latency gate exceeded ({current_rtt}ms > 20.0ms threshold, possible proxy/tunnel)")
-        return {"status": "fraud", "reason": "Network latency too high. Proxy/Tunnel detected."}
-    
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT public_key_hex, hardware_mac FROM airgated_device_registry WHERE roll_number = ?", (roll_number,))
-    result = cursor.fetchone()
+    def reject(event, detail, message, status="fraud"):
+        audit(event, roll_number, client_ip, incoming_mac, detail)
+        return {"status": status, "message": message}
 
-    if not result:
-        conn.close()
-        print(f"🚫 [Checkin Rejected] Roll: {roll_number} | IP: {client_ip} | Reason: no registry entry for this roll number (Stage 2 registry lookup failed)")
-        return {"status": "error", "reason": "Device missing registration in hardware registry."}
-    
-    public_key_hex, registered_mac = result
+    # Stage 1: single-use server challenge (also carries the server-measured RTT)
+    challenge, error = consume_challenge(nonce, "checkin", roll_number, client_ip)
+    if error:
+        return reject("checkin_bad_challenge", error, error)
+    if challenge.rtt_ms > RTT_THRESHOLD_MS:
+        return reject("latency_gate", f"median RTT {challenge.rtt_ms:.1f}ms", "Network latency too high. Proxy/Tunnel detected.")
 
-    if client_ip != "127.0.0.1" and registered_mac != "unknown_mac" and incoming_mac != registered_mac:
-        conn.close()
-        print(f"🚫 [Checkin Rejected] Roll: {roll_number} | Reason: MAC binding mismatch (request from {incoming_mac}, registered device is {registered_mac}) -- Stage 3 hardware binding failed")
-        return {"status": "fraud", "reason": "Hardware MAC address signature mismatch."}
-    
-    try:
-        pub_key_bytes = bytes.fromhex(public_key_hex)
-        sig_bytes = bytes.fromhex(signature_hex)
-        public_key = load_der_public_key(pub_key_bytes)
-        
-        public_key.verify(sig_bytes, original_challenge.encode(), padding.PKCS1v15(), hashes.SHA256())
-        
+    # Stage 2: registry lookup
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT public_key_hex, hardware_mac, face_embedding FROM airgated_device_registry WHERE roll_number = ?",
+            (roll_number,),
+        ).fetchone()
+    if not row:
+        return reject("checkin_unregistered", "no registry entry", "Device missing registration in hardware registry.", status="error")
+    public_key_hex, registered_mac, enrolled_face = row
+    if enrolled_face is None:
+        return reject("checkin_no_face", "enrolled before face verification", "Face not enrolled yet. Re-open enrollment on this device.", status="error")
+
+    # Stage 3: link-layer binding
+    if client_ip not in LOOPBACK_HOSTS and registered_mac != "unknown_mac" and incoming_mac != registered_mac:
+        return reject("mac_mismatch", f"registered {registered_mac}", "Hardware MAC address signature mismatch.")
+
+    # Stage 4: device key signed this nonce and these exact frames
+    blobs, error = await read_frames(frames)
+    if error:
+        return reject("checkin_bad_frames", error, error, status="error")
+    if not signature_valid(public_key_hex, signature_hex, signed_message("checkin", nonce, roll_number, blobs)):
+        return reject("bad_signature", "signature did not verify", "Signature validation failed.")
+
+    # Stage 5: face liveness (blinks) + identity match against the enrolled face
+    analysis, error = await analyze_face(blobs)
+    if error:
+        return {"status": "error", "message": error}
+    failure = analysis.liveness_failure(challenge.blinks_required)
+    if failure:
+        return reject("liveness_failed", failure, failure)
+    score = face_verify.similarity(face_verify.embedding_from_bytes(enrolled_face), analysis.embedding)
+    if score < face_verify.MATCH_THRESHOLD:
+        return reject("face_mismatch", f"similarity {score:.3f}", "Face does not match the enrolled student.")
+
+    # Stage 6: one device, one profile per window
+    with db_connect() as conn:
+        cursor = conn.cursor()
         if incoming_mac != "unknown_mac":
-            one_minute_ago = time.time() - 60.0
-            cursor.execute("SELECT roll_number FROM airgated_attendance_records WHERE network_mac = ? AND timestamp > ? AND roll_number != ?", (incoming_mac, one_minute_ago, roll_number))
+            cursor.execute(
+                "SELECT roll_number FROM airgated_attendance_records WHERE network_mac = ? AND timestamp > ? AND roll_number != ?",
+                (incoming_mac, time.time() - MULTI_PROFILE_WINDOW_SECONDS, roll_number),
+            )
             other_roll = cursor.fetchone()
             if other_roll:
-                print(f"🚫 [Checkin Rejected] Roll: {roll_number} | Reason: 60s multi-profile lockout -- MAC {incoming_mac} already checked in as {other_roll[0]} within the last minute")
-                return {"status": "fraud", "reason": "Multiple profile check-in detected from single hardware block."}
+                return reject("multi_profile", f"MAC already checked in as {other_roll[0]}", "Multiple profile check-in detected from single hardware block.")
 
-        cursor.execute("INSERT INTO airgated_attendance_records (roll_number, timestamp, latency_ms, network_ip, network_mac) VALUES (?, ?, ?, ?, ?)", (roll_number, time.time(), current_rtt, client_ip, incoming_mac))
+        evidence = save_evidence(roll_number, analysis.best_frame_jpeg)
+        cursor.execute(
+            "INSERT INTO airgated_attendance_records (roll_number, timestamp, latency_ms, network_ip, network_mac, face_similarity, blinks_detected, evidence_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (roll_number, time.time(), challenge.rtt_ms, client_ip, incoming_mac, score, analysis.blinks, evidence),
+        )
         conn.commit()
-        print(f"🎉 [Gateway Success] Attendance stored cleanly in SQLite ledger for Roll: {roll_number}!")
-        return {"status": "success", "message": "Attendance token logged successfully!"}
-    except Exception as e:
-        print(f"🚫 [Checkin Rejected] Roll: {roll_number} | Reason: signature/processing exception -- {type(e).__name__}: {e}")
-        return {"status": "fraud", "reason": f"Signature validation failed: {str(e)}"}
-    finally:
-        conn.close()
+
+    VERIFIED_CLIENTS[client_ip] = time.time() + VERIFIED_CLIENT_SECONDS
+    print(f"🎉 [Gateway Success] Roll: {roll_number} | face {score:.3f} | blinks {analysis.blinks} | RTT {challenge.rtt_ms:.1f}ms")
+    return {"status": "success", "message": "Attendance marked. Face and device verified!"}
+
+
+# --- INSTRUCTOR DASHBOARD (only reachable from the host laptop itself) ---
+def _table(headers, rows):
+    head = "".join(f"<th>{html.escape(h)}</th>" for h in headers)
+    body = "".join(
+        "<tr>" + "".join(f"<td>{html.escape('' if v is None else str(v))}</td>" for v in row) + "</tr>"
+        for row in rows
+    )
+    return f"<table><tr>{head}</tr>{body}</table>"
+
+
+def _fmt_time(ts):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else ""
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_dashboard(request: Request):
+    if request.client.host not in LOOPBACK_HOSTS:
+        return HTMLResponse("<h2>Forbidden</h2>", status_code=403)
+    day_start = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
+    with db_connect() as conn:
+        attendance = [
+            (_fmt_time(ts), roll, f"{rtt:.1f}" if rtt is not None else "", f"{sim:.3f}" if sim is not None else "", blinks, mac, ev)
+            for ts, roll, rtt, sim, blinks, mac, ev in conn.execute(
+                "SELECT timestamp, roll_number, latency_ms, face_similarity, blinks_detected, network_mac, evidence_file "
+                "FROM airgated_attendance_records WHERE timestamp >= ? ORDER BY timestamp DESC", (day_start,))
+        ]
+        registry = [
+            (roll, name, mac, "yes" if face is not None else "no", _fmt_time(enrolled))
+            for roll, name, mac, face, enrolled in conn.execute(
+                "SELECT roll_number, name, hardware_mac, face_embedding, enrolled_at FROM airgated_device_registry ORDER BY roll_number")
+        ]
+        audit_rows = [
+            (_fmt_time(ts), event, roll, ip, mac, detail)
+            for ts, event, roll, ip, mac, detail in conn.execute(
+                "SELECT timestamp, event, roll_number, network_ip, network_mac, detail FROM airgated_audit_log ORDER BY timestamp DESC LIMIT 200")
+        ]
+    page = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>AirGated - Instructor</title>
+    <style>body{{font-family:system-ui,sans-serif;margin:2em;color:#222}} table{{border-collapse:collapse;margin-bottom:2em;font-size:.9em}}
+    td,th{{border:1px solid #ddd;padding:6px 10px;text-align:left}} th{{background:#f4f4f5}}</style></head><body>
+    <h1>AirGated Instructor Dashboard</h1>
+    <h2>Today's attendance ({len(attendance)})</h2>
+    {_table(["Time", "Roll", "RTT ms", "Face match", "Blinks", "MAC", "Evidence"], attendance)}
+    <h2>Audit log (latest 200)</h2>
+    {_table(["Time", "Event", "Roll", "IP", "MAC", "Detail"], audit_rows)}
+    <h2>Enrolled devices ({len(registry)})</h2>
+    {_table(["Roll", "Name", "MAC", "Face enrolled", "Enrolled at"], registry)}
+    <form method="post" action="/admin/reset"><label>Reset enrollment for roll number:
+    <input name="roll_number" required></label> <button>Reset</button></form>
+    </body></html>"""
+    return HTMLResponse(page)
+
+
+@app.post("/admin/reset")
+async def admin_reset(request: Request, roll_number: str = Form(...)):
+    if request.client.host not in LOOPBACK_HOSTS:
+        return HTMLResponse("<h2>Forbidden</h2>", status_code=403)
+    with db_connect() as conn:
+        conn.execute("DELETE FROM airgated_device_registry WHERE roll_number = ?", (roll_number.strip(),))
+        conn.commit()
+    audit("instructor_reset", roll_number.strip(), request.client.host, None, "enrollment deleted by instructor")
+    return RedirectResponse("/admin", status_code=303)
 
 
 # --- COGNITIVE AI EXAM CREATOR VIEW DASHBOARD ---
@@ -641,62 +830,54 @@ async def view_exam(session_id: str):
 # MUST be the last HTTP route registered. Starlette/FastAPI match routes in registration
 # order and this pattern (/{path_name:path}) matches literally any path, so if it were
 # registered before the real endpoints above, it would intercept every request meant for
-# them first -- including POST /api/register and POST /api/checkin, both of which are in
-# its own exempt_paths list. A bare `return` from a matched route does not "fall through"
-# to the next matching route in Starlette; it just sends an empty body, which FastAPI
-# serializes as the JSON literal `null`. That is exactly what was happening here: every
-# registration and check-in request was being silently swallowed by this handler and
-# answered with `null` instead of ever reaching register_student() or verify_checkin().
-@app.api_route("/{path_name:path}", methods=["GET", "POST"])
-async def intercept_all_traffic(path_name: str, response: Response):
-    exempt_paths = [
-        "generate-captive-window", "api/register", "api/checkin", "ws/latency", "favicon.ico"
-    ]
-
-    # FIXED: Split layout checks allow API path segments to clear validation logic blocks seamlessly
-    base_segment = path_name.split("/")[0]
-    if path_name in exempt_paths or base_segment in ["api", "ws", "view-exam"]:
-        return
-
-    if any(endpoint in path_name.lower() for endpoint in SYSTEM_TELEMETRY_ENDPOINTS):
-        response.status_code = 204
-        return response
+# them first -- a bare `return` from a matched route does not "fall through" to the next
+# route in Starlette, it just sends `null` (Finding 4.2). Real endpoints never reach here, so
+# there is deliberately no exempt-path list: anything unmatched is either a connectivity
+# probe or gets redirected to the portal.
+@app.api_route("/{path_name:path}", methods=["GET", "POST", "HEAD"])
+async def intercept_all_traffic(path_name: str, request: Request):
+    portal_url = f"https://{LOCAL_IP}/generate-captive-window"
+    probe = probe_response(path_name, request.client.host, portal_url)
+    if probe is not None:
+        return probe
+    if path_name == "favicon.ico":
+        return Response(status_code=404)
 
     print(f"🪤 [Captive Trap] Intercepted user resource fetch: /{path_name} -> Forcing Secure HTTPS Redirect.")
-    response.headers["Location"] = f"https://{LOCAL_IP}:{WEB_PORT}/generate-captive-window"
-    response.status_code = 302
-    return {"message": "Redirecting to Secure Classroom Authentication Gateway..."}
+    return RedirectResponse(portal_url, status_code=302)
 
 
 if __name__ == "__main__":
+    import uvicorn
+    from certs import ensure_certs
+
+    cert_path, key_path, ca_path, reused = ensure_certs(SSL_DIR, LOCAL_IP)
+    if reused:
+        print(f"\n🔒 [Security Engine] Reusing persisted certificate {cert_path}")
+    else:
+        print(f"\n🔒 [Security Engine] Issued new certificate {cert_path} (signed by {ca_path})")
+    print(f"   Students can install the classroom CA once from http://{LOCAL_IP}/airgated-ca.crt")
+
+    try:
+        face_verify._get_models()
+        print("🙂 [Face Engine] Liveness + face-match models loaded (offline).")
+    except RuntimeError as e:
+        print(f"❌ [Face Engine] {e}")
+
     dns_thread = threading.Thread(target=run_dns_spoofer, daemon=True)
     dns_thread.start()
 
     http_detect_thread = threading.Thread(target=run_http_redirect_server, daemon=True)
     http_detect_thread.start()
 
-    import uvicorn
-    import trustme
+    print(f"🚀 Launching Secure FastAPI Web Server on HTTPS://{LOCAL_IP}:{WEB_PORT}")
+    print(f"🧑‍🏫 Instructor dashboard: https://localhost/admin (only from this laptop)")
 
-    ca = trustme.CA()
-    server_cert = ca.issue_cert(LOCAL_IP, "localhost", "127.0.0.1")
-
-    ssl_dir = "ssl_certs"
-    os.makedirs(ssl_dir, exist_ok=True)
-    cert_path = os.path.join(ssl_dir, "server.crt")
-    key_path = os.path.join(ssl_dir, "server.key")
-
-    server_cert.private_key_pem.write_to_path(key_path)
-    server_cert.cert_chain_pems[0].write_to_path(cert_path)
-
-    print(f"\n🔒 [Security Engine] SSL Certificate deployed successfully at {cert_path}")
-    print(f"🚀 Launching Secure FastAPI Web Server on HTTPS://{LOCAL_IP}:443")
-    
     uvicorn.run(
-        "server:app", 
-        host="0.0.0.0", 
-        port=443, 
-        ssl_certfile=cert_path, 
+        "server:app",
+        host="0.0.0.0",
+        port=WEB_PORT,
+        ssl_certfile=cert_path,
         ssl_keyfile=key_path,
         reload=False
     )

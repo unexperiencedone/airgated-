@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>AirGated - Verification Gate</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 16px; background: #fafafa; color: #333; }
+        .container { max-width: 420px; background: white; padding: 24px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); margin: 16px auto; }
+        #checkin-box { border-top: 4px solid #7928ca; }
+        #register-box { border-top: 4px solid #0070f3; display: none; }
+        #insecure-box { border-top: 4px solid #d97706; display: none; }
+        h2 { margin-top: 0; color: #111; font-size: 1.4em; text-align: center; }
+        p { color: #666; font-size: 0.9em; line-height: 1.5; text-align: center; margin-bottom: 20px; }
+        label { font-weight: 600; font-size: 0.85em; color: #444; display: block; margin-bottom: 5px; }
+        input { width: 100%; padding: 12px; margin-bottom: 18px; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; font-size: 1em; background: #fdfdfd; }
+        button { width: 100%; padding: 14px; color: white; border: none; border-radius: 8px; font-size: 1em; font-weight: 600; cursor: pointer; }
+        .btn-checkin { background: #7928ca; }
+        .btn-register { background: #0070f3; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        .status-msg { margin-bottom: 18px; padding: 12px; background: #f4f4f5; border-radius: 8px; font-weight: 500; font-size: 0.9em; border: 1px solid #e4e4e7; text-align: center; }
+        #face-stage { display: none; position: relative; margin: 0 auto 18px; width: 100%; max-width: 320px; aspect-ratio: 3 / 4; border-radius: 50% / 40%; overflow: hidden; background: #111; }
+        #face-stage video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+        #face-prompt { position: absolute; left: 0; right: 0; bottom: 12%; text-align: center; color: white; font-weight: 700; font-size: 1.25em; text-shadow: 0 1px 4px rgba(0,0,0,0.8); }
+        #face-stage.recording { box-shadow: 0 0 0 4px #16a34a; }
+        .hint { font-size: 0.8em; color: #888; text-align: center; margin-top: 12px; }
+        code { word-break: break-all; }
+    </style>
+</head>
+<body>
+
+    <div id="insecure-box" class="container">
+        <h2>Open the secure page</h2>
+        <p>Camera and device keys only work over HTTPS. Open this address in Chrome or Safari:</p>
+        <p><code id="secure-url"></code></p>
+    </div>
+
+    <div id="face-stage"><video id="face-video" autoplay playsinline muted></video><div id="face-prompt"></div></div>
+
+    <div id="checkin-box" class="container">
+        <h2>Classroom Check-In</h2>
+        <div id="status-box" class="status-msg">Checking this device...</div>
+        <form onsubmit="return false;">
+            <label for="roll">University Roll Number</label>
+            <input type="text" id="roll" placeholder="Enter Registered Roll Number" autocomplete="off" required>
+            <button type="button" class="btn-checkin" id="checkinBtn" onclick="startCheckIn()">Verify Face &amp; Mark Presence</button>
+        </form>
+        <div class="hint">You will be asked to look at the camera and blink a few times.</div>
+    </div>
+
+    <div id="register-box" class="container">
+        <h2>Enroll Identity (Day 1)</h2>
+        <p>This device is not enrolled yet. Enrollment binds this phone to you and records your face for future check-ins.</p>
+        <div id="reg-status" class="status-msg">Fill in your details to begin.</div>
+        <form onsubmit="return false;">
+            <label for="reg-roll">Roll Number</label>
+            <input type="text" id="reg-roll" placeholder="e.g., CSJMA24001390" autocomplete="off" required>
+            <label for="reg-name">Full Name</label>
+            <input type="text" id="reg-name" placeholder="e.g., David Dhawan" autocomplete="off" required>
+            <button type="button" class="btn-register" id="regBtn" onclick="handleRegistration()">Scan Face &amp; Enroll</button>
+        </form>
+        <div class="hint">Before enrolling, turn off "Private Wi-Fi address" / "Randomized MAC" for this network in your Wi-Fi settings.</div>
+    </div>
+
+    <script>
+        const FRAME_INTERVAL_MS = 80;   // ~12 fps: fast enough to catch a normal blink
+        const FRAME_WIDTH = 320;
+
+        // SECURITY: the private key lives only as a non-extractable CryptoKey inside IndexedDB.
+        // It is never exported to bytes and never touches localStorage, so it cannot be copied
+        // to a second device (Finding 4.1).
+        function openKeyDB() {
+            return new Promise((resolve, reject) => {
+                const req = indexedDB.open("LocalDeviceAuth", 1);
+                req.onupgradeneeded = () => { req.result.createObjectStore("keys"); };
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+            });
+        }
+
+        async function getStoredPrivateKey() {
+            const db = await openKeyDB();
+            return new Promise((resolve, reject) => {
+                const getReq = db.transaction("keys", "readonly").objectStore("keys").get("sk");
+                getReq.onsuccess = () => resolve(getReq.result || null);
+                getReq.onerror = () => reject(getReq.error);
+            });
+        }
+
+        async function savePrivateKey(cryptoKey) {
+            const db = await openKeyDB();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction("keys", "readwrite");
+                tx.objectStore("keys").put(cryptoKey, "sk");
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => reject(tx.error);
+            });
+        }
+
+        function show(id, visible) { document.getElementById(id).style.display = visible ? "block" : "none"; }
+
+        function setStatus(id, msg, color = "#333") {
+            const box = document.getElementById(id);
+            box.innerText = msg; box.style.color = color;
+        }
+
+        window.onload = async function() {
+            if (!window.isSecureContext || !window.crypto || !window.crypto.subtle || !navigator.mediaDevices) {
+                document.getElementById("secure-url").innerText = "https://" + window.location.hostname + "/generate-captive-window";
+                show("checkin-box", false); show("insecure-box", true);
+                return;
+            }
+            try {
+                if (await getStoredPrivateKey()) {
+                    setStatus("status-box", "Device enrolled. Ready to verify.");
+                    return;
+                }
+            } catch (e) { /* fall through to enrollment */ }
+            show("checkin-box", false); show("register-box", true);
+        };
+
+        function toHex(buffer) {
+            return Array.prototype.map.call(new Uint8Array(buffer), x => ('0' + x.toString(16)).slice(-2)).join('');
+        }
+
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+        // Opens the challenge WebSocket. The server measures round-trip time itself (the client
+        // never reports it) and then issues a single-use nonce plus a random blink count.
+        function requestChallenge(purpose, roll) {
+            return new Promise((resolve, reject) => {
+                const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+                const qs = new URLSearchParams({ purpose, roll }).toString();
+                const socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws/challenge?${qs}`);
+                socket.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    if (data.type === "ping") socket.send(JSON.stringify({ type: "pong" }));
+                    else if (data.type === "challenge") resolve(data);
+                    else if (data.type === "error") reject(new Error(data.reason));
+                };
+                socket.onerror = () => reject(new Error("Could not reach the classroom server."));
+            });
+        }
+
+        async function openCamera() {
+            try {
+                return await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false
+                });
+            } catch (e) {
+                if (e.name === "NotAllowedError") throw new Error("Camera permission is required for face verification.");
+                throw new Error("Could not open the front camera: " + e.message);
+            }
+        }
+
+        async function recordBlinkClip(stream, challenge) {
+            const video = document.getElementById("face-video");
+            const prompt = document.getElementById("face-prompt");
+            const stage = document.getElementById("face-stage");
+            video.srcObject = stream;
+            show("face-stage", true);
+            await video.play();
+
+            for (let i = 3; i > 0; i--) { prompt.innerText = `Look here... ${i}`; await sleep(700); }
+
+            const canvas = document.createElement("canvas");
+            canvas.width = FRAME_WIDTH;
+            canvas.height = Math.round(FRAME_WIDTH * video.videoHeight / video.videoWidth);
+            const ctx = canvas.getContext("2d");
+            const frames = [];
+            const blinkWord = challenge.blinks_required === 1 ? "time" : "times";
+            prompt.innerText = `Blink ${challenge.blinks_required} ${blinkWord} slowly`;
+            stage.classList.add("recording");
+
+            const end = performance.now() + challenge.capture_ms;
+            while (performance.now() < end) {
+                const started = performance.now();
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                frames.push(await new Promise(r => canvas.toBlob(r, "image/jpeg", 0.8)));
+                await sleep(Math.max(0, FRAME_INTERVAL_MS - (performance.now() - started)));
+            }
+
+            stage.classList.remove("recording");
+            prompt.innerText = "Verifying...";
+            return frames;
+        }
+
+        function closeCamera(stream) {
+            if (stream) stream.getTracks().forEach(t => t.stop());
+            show("face-stage", false);
+        }
+
+        // The signature covers the purpose, the server nonce, the roll number and a hash of the
+        // exact frames being submitted, so neither the nonce nor the face clip can be reused.
+        async function signSubmission(privateKey, purpose, nonce, roll, frames) {
+            const buffers = await Promise.all(frames.map(f => f.arrayBuffer()));
+            const total = buffers.reduce((n, b) => n + b.byteLength, 0);
+            const joined = new Uint8Array(total);
+            let offset = 0;
+            for (const b of buffers) { joined.set(new Uint8Array(b), offset); offset += b.byteLength; }
+            const framesHash = toHex(await crypto.subtle.digest("SHA-256", joined));
+            const message = `airgated|${purpose}|${nonce}|${roll}|${framesHash}`;
+            const sig = await crypto.subtle.sign({ name: "RSASSA-PKCS1-v1_5" }, privateKey, new TextEncoder().encode(message));
+            return toHex(sig);
+        }
+
+        function appendFrames(formData, frames) {
+            frames.forEach((blob, i) => formData.append("frames", blob, `frame_${String(i).padStart(3, "0")}.jpg`));
+        }
+
+        async function startCheckIn() {
+            const roll = document.getElementById("roll").value.trim();
+            if (!roll) { setStatus("status-box", "Roll number required.", "red"); return; }
+            const btn = document.getElementById("checkinBtn");
+            btn.disabled = true;
+            let stream = null;
+            try {
+                const privateKey = await getStoredPrivateKey();
+                if (!privateKey) throw new Error("This device is not enrolled.");
+
+                setStatus("status-box", "Opening camera...", "blue");
+                stream = await openCamera();
+                setStatus("status-box", "Measuring link to classroom server...", "blue");
+                const challenge = await requestChallenge("checkin", roll);
+
+                setStatus("status-box", `On classroom network (${challenge.rtt_ms.toFixed(1)} ms). Follow the prompt.`, "blue");
+                const frames = await recordBlinkClip(stream, challenge);
+                closeCamera(stream); stream = null;
+
+                setStatus("status-box", "Signing and verifying...", "blue");
+                const formData = new FormData();
+                formData.append("roll_number", roll);
+                formData.append("nonce", challenge.nonce);
+                formData.append("signature_hex", await signSubmission(privateKey, "checkin", challenge.nonce, roll, frames));
+                appendFrames(formData, frames);
+
+                const res = await fetch("/api/checkin", { method: "POST", body: formData });
+                const result = await res.json();
+                if (result.status === "success") setStatus("status-box", "✅ " + result.message, "green");
+                else setStatus("status-box", "❌ " + result.message, "red");
+            } catch (err) {
+                setStatus("status-box", "❌ " + err.message, "red");
+            } finally {
+                closeCamera(stream);
+                btn.disabled = false;
+            }
+        }
+
+        async function handleRegistration() {
+            const roll = document.getElementById("reg-roll").value.trim();
+            const name = document.getElementById("reg-name").value.trim();
+            if (!roll || !name) { setStatus("reg-status", "Please complete all fields.", "red"); return; }
+
+            const btn = document.getElementById("regBtn");
+            btn.disabled = true;
+            let stream = null;
+            try {
+                setStatus("reg-status", "Generating device key...", "blue");
+                const keyPair = await crypto.subtle.generateKey(
+                    { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+                    false, ["sign", "verify"]
+                );
+                const pubHex = toHex(await crypto.subtle.exportKey("spki", keyPair.publicKey));
+
+                setStatus("reg-status", "Opening camera...", "blue");
+                stream = await openCamera();
+                const challenge = await requestChallenge("register", roll);
+                setStatus("reg-status", "Follow the prompt on the camera view.", "blue");
+                const frames = await recordBlinkClip(stream, challenge);
+                closeCamera(stream); stream = null;
+
+                setStatus("reg-status", "Enrolling...", "blue");
+                const formData = new FormData();
+                formData.append("roll_number", roll);
+                formData.append("name", name);
+                formData.append("public_key", pubHex);
+                formData.append("nonce", challenge.nonce);
+                formData.append("signature_hex", await signSubmission(keyPair.privateKey, "register", challenge.nonce, roll, frames));
+                appendFrames(formData, frames);
+
+                const res = await fetch("/api/register", { method: "POST", body: formData });
+                const data = await res.json();
+                if (data.status !== "success") throw new Error(data.message);
+
+                // Only keep the key once the server has accepted it, so a rejected enrollment
+                // doesn't leave an orphaned key that makes the page think we're enrolled.
+                await savePrivateKey(keyPair.privateKey);
+                show("register-box", false); show("checkin-box", true);
+                document.getElementById("roll").value = roll;
+                setStatus("status-box", "✅ " + data.message, "green");
+            } catch (error) {
+                setStatus("reg-status", "❌ " + error.message, "red");
+            } finally {
+                closeCamera(stream);
+                btn.disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>
