@@ -10,18 +10,16 @@ import sqlite3
 import statistics
 import time
 import subprocess
-import markdown
 import re
 import platform
 import socket
 import threading
-import httpx
 import os
 from contextlib import closing
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, File, UploadFile, BackgroundTasks, Response
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, File, UploadFile, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, PlainTextResponse
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -49,7 +47,6 @@ if sys.platform == "win32":
     _ProactorBasePipeTransport._call_connection_lost = patched_call_connection_lost
 
 app = FastAPI()
-exam_cache = {}
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
@@ -75,9 +72,6 @@ MAX_FRAMES = 120
 MAX_FRAME_BYTES = 300_000
 MULTI_PROFILE_WINDOW_SECONDS = 60.0
 VERIFIED_CLIENT_SECONDS = 3 * 3600
-
-CLOUD_LLM_URL = "https://api.groq.com/openai/v1/chat/completions"
-CLOUD_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 
 # --- CAPTIVE-PORTAL CONNECTIVITY PROBES ---
@@ -832,152 +826,6 @@ async def admin_reset(request: Request, roll_number: str = Form(...)):
         conn.commit()
     audit("instructor_reset", roll_number, request.client.host, None, "enrollment deleted by instructor (lost/new phone)")
     return RedirectResponse("/admin", status_code=303)
-
-
-# --- COGNITIVE AI EXAM CREATOR VIEW DASHBOARD ---
-@app.get("/generate-exam", response_class=HTMLResponse)
-async def get_generation_page():
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>AirGated - AI Portal</title>
-        <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 3em; background: #fafafa; color: #333; }
-            .container { max-width: 650px; background: white; padding: 2.5em; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); margin: 0 auto; }
-            h2 { margin-top: 0; color: #111; font-size: 1.6em; }
-            p { color: #666; font-size: 0.95em; line-height: 1.5; }
-            textarea { width: 100%; height: 200px; padding: 12px; margin: 15px 0; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 1em; font-family: inherit; resize: vertical; }
-            button { width: 100%; padding: 12px; background: #7928ca; color: white; border: none; border-radius: 6px; font-size: 1em; font-weight: 600; cursor: pointer; transition: background 0.2s; }
-            button:hover { background: #611f9f; }
-            #status-box { margin-top: 20px; padding: 15px; border-radius: 6px; display: none; font-size: 0.95em; }
-            .processing { background: #f3e8ff; color: #6b21a8; border: 1px solid #d8b4fe; }
-            .success { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
-            a.download-btn { display: inline-block; margin-top: 10px; padding: 8px 16px; background: #166534; color: white; text-decoration: none; border-radius: 4px; font-weight: 600; font-size: 0.9em; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h2>Context-Based Question Paper Generator</h2>
-            <form id="examForm" onsubmit="return false;">
-                <textarea id="contextText" placeholder="Paste textbook context here..." required></textarea>
-                <button type="button" id="genBtn" onclick="triggerGeneration()">Compile Question Paper (PDF)</button>
-            </form>
-            <div id="status-box"></div>
-        </div>
-        <script>
-            function showStatus(msg, type) {
-                const box = document.getElementById("status-box");
-                box.className = type; box.style.display = "block"; box.innerHTML = msg;
-            }
-            async function triggerGeneration() {
-                const context = document.getElementById("contextText").value;
-                if (!context.trim()) return;
-                document.getElementById("genBtn").disabled = true;
-                showStatus("Communicating with AirGated cloud pipeline...", "processing");
-                const formData = new FormData();
-                formData.append("context_text", context);
-                try {
-                    const res = await fetch("/api/generate-exam", { method: "POST", body: formData });
-                    const data = await res.json();
-                    if (data.status === "processing") {
-                        showStatus("<strong>Pipeline Active:</strong> drafting question paper...<br><a href='" + data.download_url + "' class='download-btn' target='_blank'>Check & Download PDF</a>", "success");
-                    }
-                } catch (err) { btn.disabled = false; }
-            }
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content, status_code=200)
-
-# =====================================================================
-# STEP 1: DEFINE THE WORKER FIRST (Must sit above the endpoint)
-# =====================================================================
-async def generate_exam_worker(prompt_context: str, session_id: str):
-    system_prompt = (
-        "You are an expert university professor. Draft a strict, context-based examination paper "
-        "containing Section A (Multiple Choice Questions) and Section B (Subjective Long Answer Questions) "
-        "based entirely on the provided text. Use proper Markdown styling for your output (# for sections, "
-        "1. for ordered lists, - for options). Do not output any conversational pleasantries or chat context."
-    )
-    
-    headers = {
-        "Authorization": f"Bearer {CLOUD_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "model": "llama-3.1-8b-instant",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Context for the exam:\n{prompt_context}"}
-        ],
-        "temperature": 0.3
-    }
-    
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(CLOUD_LLM_URL, json=payload, headers=headers)
-            if response.status_code == 200:
-                raw_markdown = response.json()["choices"][0]["message"]["content"]
-            else:
-                raw_markdown = f"### Generation Error\nServer returned status code {response.status_code}\n\n{response.text}"
-        
-        html_body = markdown.markdown(raw_markdown)
-        
-        printable_template = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>AirGated Evaluation Portal</title>
-            <style>
-                @page {{ size: A4; margin: 20mm; }}
-                body {{ font-family: "Times New Roman", Times, serif; font-size: 12pt; line-height: 1.6; color: #000; margin: 0; padding: 0; }}
-                .header {{ text-align: center; margin-bottom: 30px; border-bottom: 2px solid #000; padding-bottom: 10px; }}
-                .header h1 {{ font-size: 16pt; margin: 0 0 5px 0; text-transform: uppercase; }}
-                .header h2 {{ font-size: 12pt; font-weight: normal; font-style: italic; margin: 0; }}
-                h1, h2, h3 {{ font-family: Arial, Helvetica, sans-serif; page-break-after: avoid; }}
-                h1 {{ font-size: 14pt; border-bottom: 1px solid #ddd; margin-top: 25px; padding-bottom: 3px; }}
-                h2 {{ font-size: 12pt; margin-top: 20px; }}
-                ul, ol {{ margin-top: 5px; padding-left: 25px; }}
-                li {{ margin-bottom: 5px; }}
-                .no-print-bar {{ background: #f4f4f5; padding: 15px; border-bottom: 1px solid #e4e4e7; text-align: center; margin-bottom: 30px; font-family: sans-serif; }}
-                .print-btn {{ padding: 10px 24px; background: #7928ca; color: white; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 14px; }}
-                @media print {{
-                    .no-print-bar {{ display: none !important; }}
-                    body {{ font-size: 12pt; line-height: 1.5; }}
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="no-print-bar">
-                <button class="print-btn" onclick="window.print()">Print / Save as PDF</button>
-            </div>
-            <div class="header">
-                <h1>Institutional Evaluation Portal</h1>
-                <h2>Automated Context-Based Examination Sheet</h2>
-            </div>
-            <div class="content">{html_body}</div>
-        </body>
-        </html>
-        """
-        exam_cache[session_id] = printable_template
-        print(f"✅ [AI Engine] Rendered layout mapped successfully: {session_id}")
-    except Exception as e:
-        exam_cache[session_id] = f"<h2>System Compilation Exception</h2><p>{str(e)}</p>"
-
-@app.post("/api/generate-exam")
-async def create_exam(background_tasks: BackgroundTasks, context_text: str = Form(...)):
-    session_id = f"exam_{int(time.time())}"
-    exam_cache[session_id] = "<h2>Processing...</h2><p>The AirGated AI engine is drafting your question paper document. Please reload this tab momentarily.</p>"
-    background_tasks.add_task(generate_exam_worker, context_text, session_id)
-    return {"status": "processing", "message": "The AirGated AI engine is drafting the question paper.", "download_url": f"/view-exam/{session_id}"}
-
-
-@app.get("/view-exam/{session_id}", response_class=HTMLResponse)
-async def view_exam(session_id: str):
-    return exam_cache.get(session_id, "<h2>Invalid Token</h2>")
 
 
 # --- MODULE 1 CATCH-ALL ROUTE INTERCEPTOR MIDDLEWARE (HARDENED) ---

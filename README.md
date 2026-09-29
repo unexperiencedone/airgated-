@@ -376,7 +376,7 @@ That's harmless: students just start their check-in again.
 
 ```
 server.py               FastAPI app: DNS spoofer, HTTP :80 listener, portal, challenge
-                        WebSocket, /api/register, /api/checkin, /admin dashboard, exam gen.
+                        WebSocket, /api/register, /api/checkin, /admin dashboard
 face_verify.py          Face detection, blink counting, face embeddings (offline)
 certs.py                Creates the classroom CA + server certificate once, then reuses them
 fetch_models.py         Downloads the 3 face models (checksum-verified)
@@ -385,7 +385,6 @@ templates/landing.html  The page shown in the OS "Sign in" popup (HTTP)
 tests/                  Automated tests (see section 13)
 archive/                Old prototypes kept for history; not used
 requirements.txt        Python dependencies
-.env.example            GROQ_API_KEY placeholder (for the exam generator only)
 AirGated_Report.md      Original project write-up (May 2026)
 AirGated_Progress_Report.*  Critical-analysis progress report (Aug 2026)
 AirGated_Technical_Report_v2.*  Technical report v2.0 (Sep 2026): design, live trial, test evidence
@@ -404,7 +403,6 @@ python -m venv .venv
 .venv\Scripts\activate            # Windows  (macOS/Linux: source .venv/bin/activate)
 pip install -r requirements.txt
 python fetch_models.py            # ~42 MB into models/
-copy .env.example .env            # then put your GROQ_API_KEY in .env (only for /generate-exam)
 ```
 
 **Each class:**
@@ -579,7 +577,7 @@ stay under 20 ms. Those need a trial with real phones.
 | 4.2 | Catch-all route swallowed the APIs (`null`) | Catch-all registered last, no exempt list; covered by a test |
 | 4.2b | OS "Sign in" popup never appeared | Probes redirect until the phone checks in, then return `204`/"Success"; landing page on port 80 |
 | 4.3 (software part) | MAC collision silently overwrote registrations | Re-keying requires a face match; one phone can't take another roll number; everything audited |
-| 4.6 | Groq API key in source | Moved to `.env` (git-ignored); `.env.example` added |
+| 4.6 | Groq API key in source | Key moved out of the code; later the exam generator that needed it was removed entirely, so there's no API key at all |
 | 4.7 | New certificate on every restart | CA + certificate created once and reused; CA downloadable for one-time install |
 | 4.8 | Three overlapping implementations | Old ones moved to `archive/`; one live path |
 | 4.9 | No automated tests | 31 tests, checked with deliberate bugs |
@@ -607,15 +605,11 @@ stay under 20 ms. Those need a trial with real phones.
 7. **MAC randomization can't be detected.** If a student forgets to turn it off, they fail the MAC
    check. They can recover by re-enrolling with their face.
 8. **No rate limiting.** The challenge WebSocket and the APIs don't limit repeated attempts from one phone.
-9. **Exam generator is open to the whole network.** Any connected phone can use `/generate-exam`,
-   spending the Groq key. The generated page also includes the model's HTML output unescaped.
-10. **Dashboard has no password.** It relies only on "requests from the laptop itself".
-11. **In-memory state.** Nonces and verified phones are lost on restart, and the design assumes a
+9. **Dashboard has no password.** It relies only on "requests from the laptop itself".
+10. **In-memory state.** Nonces and verified phones are lost on restart, and the design assumes a
     single server process.
-12. **Performance at class scale is unmeasured.** Face analysis takes a few seconds of CPU per check-in,
+11. **Performance at class scale is unmeasured.** Face analysis takes a few seconds of CPU per check-in,
     and nobody has measured whether 60+ students close together keep the latency gate reliable.
-13. **Biometric data handling.** Face embeddings and evidence photos are stored with no automatic
+12. **Biometric data handling.** Face embeddings and evidence photos are stored with no automatic
     deletion and no consent screen, which students and the institution may require.
-14. **Leftovers.** The legacy tables `students` and `attendance_log` are still in the database,
-    `AirGated_Report.md` still describes the old design as "production-ready", and `test_qroq.py` is a
-    manual script rather than a test.
+13. **Leftovers.** `AirGated_Report.md` still describes the old design as "production-ready".
