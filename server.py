@@ -66,7 +66,8 @@ LOOPBACK_HOSTS = ("127.0.0.1", "::1")
 
 # --- VERIFICATION POLICY ---
 RTT_THRESHOLD_MS = 20.0
-RTT_PING_COUNT = 5
+RTT_WARMUP_PINGS = 3   # discarded: wake the phone's Wi-Fi radio out of power-save first
+RTT_PING_COUNT = 10
 CHALLENGE_TTL_SECONDS = 120
 CAPTURE_MS = 5000
 BLINK_CHOICES = (2, 3)
@@ -395,9 +396,21 @@ async def https_ca_cert():
     return ca_cert_response()
 
 
+def summarize_rtt(samples):
+    """Return (gate_ms, median_ms) for a list of round-trip times.
+
+    The gate uses the fastest round trip, not the median. Phones in Wi-Fi power-save only wake
+    every beacon interval (~100 ms), so a few pings in any burst come back slow even at 1 m from
+    the access point -- that is radio sleep, not distance. Sleep, congestion and retries can only
+    ever make a ping slower, while a tunnel or relay cannot make its fastest ping quicker than
+    its real path, so the minimum is the honest measure of "is this a direct local link".
+    """
+    return min(samples), statistics.median(samples)
+
+
 # --- WEBSOCKET: SERVER-MEASURED PROXIMITY + CHALLENGE ISSUANCE ---
-# The server times several ping/pong round trips itself and keeps the median, so the RTT used
-# by the latency gate is never a number the client reports.
+# The server times the ping/pong round trips itself, so the RTT used by the latency gate is never
+# a number the client reports.
 @app.websocket("/ws/challenge")
 async def websocket_challenge_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -411,15 +424,16 @@ async def websocket_challenge_endpoint(websocket: WebSocket):
             return
 
         samples = []
-        for _ in range(RTT_PING_COUNT):
+        for i in range(RTT_WARMUP_PINGS + RTT_PING_COUNT):
             start = time.perf_counter()
             await websocket.send_json({"type": "ping"})
             await websocket.receive_json()
-            samples.append((time.perf_counter() - start) * 1000)
-        rtt_ms = statistics.median(samples)
+            if i >= RTT_WARMUP_PINGS:
+                samples.append((time.perf_counter() - start) * 1000)
+        rtt_ms, median_ms = summarize_rtt(samples)
 
         if purpose == "checkin" and rtt_ms > RTT_THRESHOLD_MS:
-            audit("latency_gate", roll_number, client_ip, None, f"median RTT {rtt_ms:.1f}ms > {RTT_THRESHOLD_MS}ms")
+            audit("latency_gate", roll_number, client_ip, None, f"best RTT {rtt_ms:.1f}ms > {RTT_THRESHOLD_MS}ms (median {median_ms:.1f}ms)")
             await websocket.send_json({"type": "error", "reason": "Network latency too high. Connect directly to the classroom Wi-Fi."})
             await websocket.close()
             return
@@ -558,7 +572,7 @@ async def verify_checkin(
     if error:
         return reject("checkin_bad_challenge", error, error)
     if challenge.rtt_ms > RTT_THRESHOLD_MS:
-        return reject("latency_gate", f"median RTT {challenge.rtt_ms:.1f}ms", "Network latency too high. Proxy/Tunnel detected.")
+        return reject("latency_gate", f"best RTT {challenge.rtt_ms:.1f}ms", "Network latency too high. Proxy/Tunnel detected.")
 
     # Stage 2: registry lookup
     with db_connect() as conn:

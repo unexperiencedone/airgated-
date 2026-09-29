@@ -23,6 +23,7 @@ import face_verify  # noqa: E402
 import server  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+REAL_RTT_THRESHOLD_MS = server.RTT_THRESHOLD_MS  # captured before fixtures relax it
 FRAMES = [b"frame-%d" % i for i in range(6)]
 STUDENT_FACE = face_verify._normalize(np.eye(128, dtype=np.float32)[0])
 OTHER_FACE = face_verify._normalize(np.eye(128, dtype=np.float32)[1])
@@ -169,6 +170,16 @@ def test_latency_gate_uses_server_rtt(client, monkeypatch):
     msg = get_challenge(client, "checkin", "R1")
     assert msg["type"] == "error"
     assert "latency_gate" in audit_events()
+
+
+def test_rtt_gate_ignores_power_save_spikes():
+    # Real numbers from a classroom test: an honest phone at 1 m with radio-sleep spikes.
+    spiky_but_local = [212.9, 4.1, 5.0, 180.2, 3.9, 6.2, 4.4, 101.7, 5.1, 4.8]
+    gate, median = server.summarize_rtt(spiky_but_local)
+    assert gate <= REAL_RTT_THRESHOLD_MS  # passes on the fastest round trip...
+    assert median > 4.0                     # ...even though the median alone looked worse
+    relayed = [38.0, 41.5, 36.2, 44.0, 39.9, 37.1, 52.3, 40.0, 36.9, 38.4]
+    assert server.summarize_rtt(relayed)[0] > REAL_RTT_THRESHOLD_MS
 
 
 def test_face_mismatch_rejected(client, monkeypatch):
