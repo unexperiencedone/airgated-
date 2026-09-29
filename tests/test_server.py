@@ -265,3 +265,39 @@ def test_portal_uses_non_extractable_indexeddb_key(client):
 
 def test_admin_is_localhost_only(client):
     assert client.get("/admin").status_code == 403
+
+
+def test_dashboard_stats(client, monkeypatch):
+    present_student, failing_student = Device(), Device()
+    enroll(client, present_student, roll="R1", name="Asha")
+    monkeypatch.setattr(server, "get_client_mac", lambda ip: "aa:bb:cc:dd:ee:02")
+    enroll(client, failing_student, roll="R2", name="Bilal")
+    monkeypatch.setattr(server, "get_client_mac", lambda ip: "aa:bb:cc:dd:ee:01")
+    assert check_in(client, present_student, roll="R1")["status"] == "success"
+    monkeypatch.setattr(server, "get_client_mac", lambda ip: "aa:bb:cc:dd:ee:02")
+    monkeypatch.setattr(server.face_verify, "analyze", lambda frames: fake_analysis(embedding=OTHER_FACE))
+    assert check_in(client, failing_student, roll="R2")["status"] == "fraud"
+
+    local = TestClient(server.app, client=("127.0.0.1", 50000))
+    page = local.get("/admin").text
+    assert "Present (1)" in page and "Absent (1)" in page
+    assert "Failed check-in attempts (1)" in page
+    assert "Needs attention: failed and never marked present (1)" in page
+    assert "Face did not match enrolled student" in page
+    assert "Bilal" in page and "50%" in page
+
+
+def test_reset_lets_student_enroll_new_phone(client, monkeypatch):
+    enroll(client, Device(), roll="R1")
+    # Lost phone: new device, new MAC, and (say) a face that no longer matches well enough.
+    monkeypatch.setattr(server, "get_client_mac", lambda ip: "aa:bb:cc:dd:ee:55")
+    monkeypatch.setattr(server.face_verify, "analyze", lambda frames: fake_analysis(embedding=OTHER_FACE))
+    new_phone = Device()
+    assert enroll(client, new_phone, roll="R1")["status"] == "error"
+
+    assert client.post("/admin/reset", data={"roll_number": "R1"}).status_code == 403  # not from the laptop
+    local = TestClient(server.app, client=("127.0.0.1", 50000))
+    assert local.post("/admin/reset", data={"roll_number": "R1"}, follow_redirects=False).status_code == 303
+    assert "instructor_reset" in audit_events()
+    assert enroll(client, new_phone, roll="R1")["status"] == "success"
+    assert check_in(client, new_phone, roll="R1")["status"] == "success"

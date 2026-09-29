@@ -86,7 +86,7 @@ flowchart TB
 | 53 | UDP | the phone's OS | Every DNS lookup resolves to the laptop, so all traffic comes here |
 | 80 | HTTP | the phone's OS and the sign-in popup | Connectivity probes, the landing page, and download of the classroom certificate |
 | 443 | HTTPS | the student's browser | Portal page, challenge WebSocket, `/api/register`, `/api/checkin` |
-| 443 (localhost only) | HTTPS | the instructor | `/admin` dashboard |
+| 443 (localhost only) | HTTPS | the instructor | `/admin` attendance dashboard + enrollment reset |
 
 HTTPS is required because browsers only allow the camera (`getUserMedia`) and device keys
 (`crypto.subtle`) on secure pages.
@@ -307,7 +307,7 @@ flowchart TD
     F -- no --> X3["❌ ask instructor to reset"]
 ```
 
-The instructor can always open `https://localhost/admin` on the laptop and **reset** a roll number.
+If a student loses their phone, the instructor uses **Reset a student's enrollment** on the `https://localhost/admin` dashboard. That deletes the old key and face so the student can enroll again from the new phone. Every reset is logged (`instructor_reset`).
 
 ---
 
@@ -376,7 +376,7 @@ That's harmless: students just start their check-in again.
 
 ```
 server.py               FastAPI app: DNS spoofer, HTTP :80 listener, portal, challenge
-                        WebSocket, /api/register, /api/checkin, /admin, exam generator
+                        WebSocket, /api/register, /api/checkin, /admin dashboard, exam gen.
 face_verify.py          Face detection, blink counting, face embeddings (offline)
 certs.py                Creates the classroom CA + server certificate once, then reuses them
 fetch_models.py         Downloads the 3 face models (checksum-verified)
@@ -413,7 +413,19 @@ copy .env.example .env            # then put your GROQ_API_KEY in .env (only for
 3. Turn the hotspot **on**. The server has to claim port 53 before Windows ICS does.
 4. Students join the Wi-Fi, follow the popup to `https://192.168.137.1/generate-captive-window`,
    and check in.
-5. On the laptop, open `https://localhost/admin` for attendance, the audit log and resets.
+5. On the laptop, open `https://localhost/admin` for the attendance dashboard. It refreshes every 30 s, and you can pick another day.
+
+**What the dashboard shows** (it's read-only apart from the reset form):
+
+| Section | What it tells you |
+|---|---|
+| Summary cards | Enrolled, present, absent, attendance rate, failed check-ins, and students who failed and were never marked present |
+| Why check-ins failed | Bar chart of failure reasons (face mismatch, liveness, MAC, latency, ...) |
+| Students present, last 7 days | Daily attendance trend |
+| Needs attention | Students who tried, failed, and still aren't marked present, with the reason |
+| Present / Absent | Who checked in (time, face-match score, blinks, RTT) and who didn't |
+| Failed check-in attempts / Failed enrollments | Every rejected attempt, with time, roll number, reason and detail |
+| Reset a student's enrollment | For a lost or replaced phone: deletes the student's key and face so they can enroll again |
 
 **One-time steps for each student:**
 
@@ -445,7 +457,7 @@ Every test has the same three steps, often called *Arrange, Act, Assert*:
 Run all of them with:
 
 ```bash
-python -m pytest tests        # 28 tests, about 20 seconds
+python -m pytest tests        # 30 tests, about 20 seconds
 ```
 
 ### A real example, line by line
@@ -508,7 +520,7 @@ against each one.
 | Probes answered `204` to everyone (the original popup bug) | `test_probe_redirects_until_verified`, `test_http_listener_probe_behaviour` |
 | MAC check disabled | `test_mac_mismatch_rejected` |
 
-Every bug was caught. With the real code, all 28 tests pass.
+Every bug was caught. With the real code, all 30 tests pass.
 
 ### What each test checks
 
@@ -535,6 +547,8 @@ Every bug was caught. With the real code, all 28 tests pass.
 | `test_http_listener_probe_behaviour` | Same on the port-80 app | `302` to `/welcome` before, `204` after |
 | `test_portal_uses_non_extractable_indexeddb_key` | Load the portal page | No `localStorage.` use, no key export, key generated with `extractable: false` |
 | `test_admin_is_localhost_only` | Open `/admin` from a non-localhost client | `403 Forbidden` |
+| `test_dashboard_stats` | One student checks in and another fails the face check | Dashboard shows Present (1), Absent (1), 50%, 1 failed attempt with the reason "Face did not match", and 1 student needing attention |
+| `test_reset_lets_student_enroll_new_phone` | A student with a new phone is refused; the instructor resets them | Reset refused from outside the laptop; from the laptop it works, is audited, and the new phone can enroll and check in |
 
 **`tests/test_face_verify.py`: the face logic itself**
 
@@ -566,10 +580,10 @@ stay under 20 ms. Those need a trial with real phones.
 | 4.6 | Groq API key in source | Moved to `.env` (git-ignored); `.env.example` added |
 | 4.7 | New certificate on every restart | CA + certificate created once and reused; CA downloadable for one-time install |
 | 4.8 | Three overlapping implementations | Old ones moved to `archive/`; one live path |
-| 4.9 | No automated tests | 28 tests, checked with deliberate bugs |
+| 4.9 | No automated tests | 30 tests, checked with deliberate bugs |
 | 4.10 | Git out of date; DB and `__pycache__` tracked | Everything committed; DB and `__pycache__` removed from **all** history and ignored |
 | Section 5 | Challenge was a hard-coded constant (replayable forever) | Single-use server nonce bound to roll number, IP and purpose, with a 120 s expiry |
-| Section 7 "Later" | Rejections only printed to the console | `airgated_audit_log` table + `/admin` dashboard |
+| Section 7 "Later" | Rejections only printed to the console | `airgated_audit_log` table + `/admin` attendance dashboard (who's present or absent, who failed and why, 7-day trend) with enrollment reset |
 | *(new)* | Latency came from the phone (`current_rtt`), and only the last ping was timed | Server times 5 pings and takes the median |
 | *(new)* | Friend could check in with your phone | KYC face + blink check at enrollment and every check-in |
 
@@ -593,7 +607,7 @@ stay under 20 ms. Those need a trial with real phones.
 8. **No rate limiting.** The challenge WebSocket and the APIs don't limit repeated attempts from one phone.
 9. **Exam generator is open to the whole network.** Any connected phone can use `/generate-exam`,
    spending the Groq key. The generated page also includes the model's HTML output unescaped.
-10. **Instructor dashboard has no password.** It relies only on "requests from the laptop itself".
+10. **Dashboard has no password.** It relies only on "requests from the laptop itself".
 11. **In-memory state.** Nonces and verified phones are lost on restart, and the design assumes a
     single server process.
 12. **Performance at class scale is unmeasured.** Face analysis takes a few seconds of CPU per check-in,

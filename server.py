@@ -1,5 +1,6 @@
 import sys
 import asyncio
+import datetime
 import hashlib
 import html
 import logging
@@ -617,8 +618,33 @@ async def verify_checkin(
     return {"status": "success", "message": "Attendance marked. Face and device verified!"}
 
 
-# --- INSTRUCTOR DASHBOARD (only reachable from the host laptop itself) ---
-def _table(headers, rows):
+# --- ATTENDANCE DASHBOARD (read-only stats; only reachable from the host laptop itself) ---
+CHECKIN_FAILURES = {
+    "checkin_bad_challenge": "Expired or reused request",
+    "latency_gate": "Latency too high (not on classroom Wi-Fi?)",
+    "checkin_unregistered": "Roll number not enrolled",
+    "checkin_no_face": "Face not enrolled yet",
+    "mac_mismatch": "Different device (MAC mismatch)",
+    "checkin_bad_frames": "Bad camera upload",
+    "bad_signature": "Invalid device signature",
+    "liveness_failed": "Liveness failed (blinks / face visibility)",
+    "face_mismatch": "Face did not match enrolled student",
+    "multi_profile": "One device used for several students",
+}
+ENROLLMENT_FAILURES = {
+    "register_bad_challenge": "Expired or reused request",
+    "register_bad_signature": "Invalid device signature",
+    "register_liveness_failed": "Liveness failed (blinks / face visibility)",
+    "register_device_taken": "Device already enrolled to another roll",
+    "reenroll_face_mismatch": "Re-enrollment face did not match",
+    "legacy_upgrade_refused": "Roll enrolled from another device",
+}
+TREND_DAYS = 7
+
+
+def _table(headers, rows, empty="Nothing to show."):
+    if not rows:
+        return f'<p class="empty">{html.escape(empty)}</p>'
     head = "".join(f"<th>{html.escape(h)}</th>" for h in headers)
     body = "".join(
         "<tr>" + "".join(f"<td>{html.escape('' if v is None else str(v))}</td>" for v in row) + "</tr>"
@@ -627,45 +653,158 @@ def _table(headers, rows):
     return f"<table><tr>{head}</tr>{body}</table>"
 
 
+def _bars(items, total):
+    """Horizontal bar chart from (label, count) pairs, scaled against `total`."""
+    if not items:
+        return '<p class="empty">Nothing to show.</p>'
+    rows = []
+    for label, count in items:
+        pct = 100 * count / total if total else 0
+        rows.append(
+            f'<div class="bar-row"><span class="bar-label">{html.escape(label)}</span>'
+            f'<span class="bar-track"><span class="bar-fill" style="width:{pct:.1f}%"></span></span>'
+            f'<span class="bar-value">{count}</span></div>'
+        )
+    return "".join(rows)
+
+
 def _fmt_time(ts):
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else ""
+    return time.strftime("%H:%M:%S", time.localtime(ts)) if ts else ""
+
+
+def _day_bounds(day):
+    start = datetime.datetime.combine(day, datetime.time.min).timestamp()
+    return start, start + 86400
 
 
 @app.get("/admin", response_class=HTMLResponse)
-async def admin_dashboard(request: Request):
+async def admin_dashboard(request: Request, date: str = ""):
     if request.client.host not in LOOPBACK_HOSTS:
         return HTMLResponse("<h2>Forbidden</h2>", status_code=403)
-    day_start = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
+    try:
+        day = datetime.date.fromisoformat(date) if date else datetime.date.today()
+    except ValueError:
+        day = datetime.date.today()
+    start, end = _day_bounds(day)
+
     with db_connect() as conn:
-        attendance = [
-            (_fmt_time(ts), roll, f"{rtt:.1f}" if rtt is not None else "", f"{sim:.3f}" if sim is not None else "", blinks, mac, ev)
-            for ts, roll, rtt, sim, blinks, mac, ev in conn.execute(
-                "SELECT timestamp, roll_number, latency_ms, face_similarity, blinks_detected, network_mac, evidence_file "
-                "FROM airgated_attendance_records WHERE timestamp >= ? ORDER BY timestamp DESC", (day_start,))
-        ]
-        registry = [
-            (roll, name, mac, "yes" if face is not None else "no", _fmt_time(enrolled))
-            for roll, name, mac, face, enrolled in conn.execute(
-                "SELECT roll_number, name, hardware_mac, face_embedding, enrolled_at FROM airgated_device_registry ORDER BY roll_number")
-        ]
-        audit_rows = [
-            (_fmt_time(ts), event, roll, ip, mac, detail)
-            for ts, event, roll, ip, mac, detail in conn.execute(
-                "SELECT timestamp, event, roll_number, network_ip, network_mac, detail FROM airgated_audit_log ORDER BY timestamp DESC LIMIT 200")
-        ]
-    page = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>AirGated - Instructor</title>
-    <style>body{{font-family:system-ui,sans-serif;margin:2em;color:#222}} table{{border-collapse:collapse;margin-bottom:2em;font-size:.9em}}
-    td,th{{border:1px solid #ddd;padding:6px 10px;text-align:left}} th{{background:#f4f4f5}}</style></head><body>
-    <h1>AirGated Instructor Dashboard</h1>
-    <h2>Today's attendance ({len(attendance)})</h2>
-    {_table(["Time", "Roll", "RTT ms", "Face match", "Blinks", "MAC", "Evidence"], attendance)}
-    <h2>Audit log (latest 200)</h2>
-    {_table(["Time", "Event", "Roll", "IP", "MAC", "Detail"], audit_rows)}
-    <h2>Enrolled devices ({len(registry)})</h2>
-    {_table(["Roll", "Name", "MAC", "Face enrolled", "Enrolled at"], registry)}
-    <form method="post" action="/admin/reset"><label>Reset enrollment for roll number:
-    <input name="roll_number" required></label> <button>Reset</button></form>
-    </body></html>"""
+        names = dict(conn.execute("SELECT roll_number, name FROM airgated_device_registry"))
+        checkins = conn.execute(
+            "SELECT roll_number, timestamp, latency_ms, face_similarity, blinks_detected FROM airgated_attendance_records "
+            "WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp", (start, end)).fetchall()
+        events = conn.execute(
+            "SELECT timestamp, event, roll_number, detail FROM airgated_audit_log "
+            "WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp DESC", (start, end)).fetchall()
+        trend = []
+        for offset in range(TREND_DAYS - 1, -1, -1):
+            d = day - datetime.timedelta(days=offset)
+            s, e = _day_bounds(d)
+            count = conn.execute(
+                "SELECT COUNT(DISTINCT roll_number) FROM airgated_attendance_records WHERE timestamp >= ? AND timestamp < ?",
+                (s, e)).fetchone()[0]
+            trend.append((d.strftime("%a %d %b"), count))
+
+    # Present: first successful check-in per student.
+    present = {}
+    for roll, ts, rtt, sim, blinks in checkins:
+        if roll not in present:
+            present[roll] = [ts, rtt, sim, blinks, 0]
+        present[roll][4] += 1
+
+    checkin_fails = [e for e in events if e[1] in CHECKIN_FAILURES]
+    enroll_fails = [e for e in events if e[1] in ENROLLMENT_FAILURES]
+    failed_rolls = {roll for _, _, roll, _ in checkin_fails}
+    never_succeeded = sorted(r for r in failed_rolls if r not in present)
+    absent = sorted(r for r in names if r not in present)
+
+    enrolled = len(names)
+    rate = f"{100 * len(present) / enrolled:.0f}%" if enrolled else "–"
+    stats = [
+        ("Enrolled", enrolled), ("Present", len(present)), ("Absent", len(absent)),
+        ("Attendance rate", rate), ("Failed check-ins", len(checkin_fails)),
+        ("Failed, never marked", len(never_succeeded)),
+    ]
+    cards = "".join(
+        f'<div class="card"><div class="num">{html.escape(str(v))}</div><div class="lbl">{html.escape(k)}</div></div>'
+        for k, v in stats
+    )
+
+    reason_counts = {}
+    for _, event, _, _ in checkin_fails:
+        reason_counts[CHECKIN_FAILURES[event]] = reason_counts.get(CHECKIN_FAILURES[event], 0) + 1
+    reasons = sorted(reason_counts.items(), key=lambda kv: -kv[1])
+
+    present_rows = [
+        (roll, names.get(roll, ""), _fmt_time(ts), f"{sim:.3f}" if sim is not None else "",
+         blinks, f"{rtt:.1f}" if rtt is not None else "", n)
+        for roll, (ts, rtt, sim, blinks, n) in sorted(present.items(), key=lambda kv: kv[1][0])
+    ]
+    attention_rows = []
+    for roll in never_succeeded:
+        attempts = [e for e in checkin_fails if e[2] == roll]
+        attention_rows.append((roll, names.get(roll, "(not enrolled)"), len(attempts), CHECKIN_FAILURES[attempts[0][1]]))
+    fail_rows = [
+        (_fmt_time(ts), roll, names.get(roll, ""), CHECKIN_FAILURES[event], detail)
+        for ts, event, roll, detail in checkin_fails
+    ]
+    enroll_rows = [
+        (_fmt_time(ts), roll, ENROLLMENT_FAILURES[event], detail)
+        for ts, event, roll, detail in enroll_fails
+    ]
+
+    page = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="30">
+    <title>AirGated - Attendance</title>
+    <style>
+      body{{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:24px;background:#fafafa;color:#222}}
+      main{{max-width:1100px;margin:0 auto}}
+      header{{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px}}
+      h1{{margin:0;font-size:1.5em}} h2{{font-size:1.1em;margin:28px 0 10px}}
+      .cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:20px}}
+      .card{{background:#fff;border:1px solid #e4e4e7;border-radius:10px;padding:14px}}
+      .num{{font-size:1.8em;font-weight:700}} .lbl{{color:#666;font-size:.85em}}
+      .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px}}
+      .panel{{background:#fff;border:1px solid #e4e4e7;border-radius:10px;padding:4px 16px 16px;overflow-x:auto}}
+      table{{border-collapse:collapse;width:100%;font-size:.88em}}
+      td,th{{border-bottom:1px solid #eee;padding:6px 8px;text-align:left}} th{{background:#f4f4f5}}
+      .bar-row{{display:flex;align-items:center;gap:8px;margin:6px 0;font-size:.88em}}
+      .bar-label{{flex:0 0 45%}} .bar-track{{flex:1;background:#f1f1f3;border-radius:4px;height:12px}}
+      .bar-fill{{display:block;height:12px;border-radius:4px;background:#7928ca}}
+      .bar-value{{flex:0 0 2.5em;text-align:right;font-variant-numeric:tabular-nums}}
+      .fail .bar-fill{{background:#dc2626}} .empty{{color:#888;font-size:.9em}}
+    </style></head><body><main>
+    <header><h1>Attendance · {html.escape(day.strftime("%A %d %B %Y"))}</h1>
+      <form method="get" action="/admin"><input type="date" name="date" value="{day.isoformat()}"> <button>Show</button></form>
+    </header>
+    <div class="cards">{cards}</div>
+
+    <div class="grid">
+      <div class="panel"><h2>Why check-ins failed</h2><div class="fail">{_bars(reasons, len(checkin_fails))}</div></div>
+      <div class="panel"><h2>Students present, last {TREND_DAYS} days</h2>{_bars(trend, enrolled or max((c for _, c in trend), default=0))}</div>
+    </div>
+
+    <h2>Needs attention: failed and never marked present ({len(attention_rows)})</h2>
+    <div class="panel">{_table(["Roll", "Name", "Failed attempts", "First failure reason"], attention_rows, "No one is stuck.")}</div>
+
+    <h2>Present ({len(present_rows)})</h2>
+    <div class="panel">{_table(["Roll", "Name", "Checked in", "Face match", "Blinks", "RTT ms", "Check-ins"], present_rows, "No check-ins yet.")}</div>
+
+    <h2>Absent ({len(absent)})</h2>
+    <div class="panel">{_table(["Roll", "Name"], [(r, names[r]) for r in absent], "Everyone enrolled is present.")}</div>
+
+    <h2>Failed check-in attempts ({len(fail_rows)})</h2>
+    <div class="panel">{_table(["Time", "Roll", "Name", "Reason", "Detail"], fail_rows, "No failed attempts.")}</div>
+
+    <h2>Failed enrollments ({len(enroll_rows)})</h2>
+    <div class="panel">{_table(["Time", "Roll", "Reason", "Detail"], enroll_rows, "No failed enrollments.")}</div>
+
+    <h2>Reset a student's enrollment</h2>
+    <div class="panel"><p class="empty">For a lost or replaced phone: this deletes the student's device key and
+      enrolled face so they can enroll again from the new phone.</p>
+      <form method="post" action="/admin/reset"><input name="roll_number" placeholder="Roll number" required>
+      <button>Reset enrollment</button></form></div>
+    </main></body></html>"""
     return HTMLResponse(page)
 
 
@@ -673,10 +812,11 @@ async def admin_dashboard(request: Request):
 async def admin_reset(request: Request, roll_number: str = Form(...)):
     if request.client.host not in LOOPBACK_HOSTS:
         return HTMLResponse("<h2>Forbidden</h2>", status_code=403)
+    roll_number = roll_number.strip()
     with db_connect() as conn:
-        conn.execute("DELETE FROM airgated_device_registry WHERE roll_number = ?", (roll_number.strip(),))
+        conn.execute("DELETE FROM airgated_device_registry WHERE roll_number = ?", (roll_number,))
         conn.commit()
-    audit("instructor_reset", roll_number.strip(), request.client.host, None, "enrollment deleted by instructor")
+    audit("instructor_reset", roll_number, request.client.host, None, "enrollment deleted by instructor (lost/new phone)")
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -871,7 +1011,7 @@ if __name__ == "__main__":
     http_detect_thread.start()
 
     print(f"🚀 Launching Secure FastAPI Web Server on HTTPS://{LOCAL_IP}:{WEB_PORT}")
-    print(f"🧑‍🏫 Instructor dashboard: https://localhost/admin (only from this laptop)")
+    print(f"📊 Attendance dashboard: https://localhost/admin (only from this laptop)")
 
     uvicorn.run(
         "server:app",
