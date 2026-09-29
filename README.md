@@ -2,6 +2,8 @@
 
 **Offline classroom attendance with device binding and a KYC-style face + blink check.**
 
+Repository: <https://github.com/unexperiencedone/airgated->
+
 The instructor's laptop creates a Wi-Fi network. Students join it and check in on their phones.
 To be marked present, a student has to prove all of the following at the same moment:
 
