@@ -4,6 +4,10 @@
 
 Repository: <https://github.com/unexperiencedone/airgated->
 
+> **Acknowledgement:** I designed AirGated, made the design decisions and tested it with real students
+> and phones. I used Claude (Anthropic's AI coding assistant) to help me write most of the code, tests
+> and documentation.
+
 The instructor's laptop creates a Wi-Fi network. Students join it and check in on their phones.
 To be marked present, a student has to prove all of the following at the same moment:
 
