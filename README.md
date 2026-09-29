@@ -143,7 +143,7 @@ sequenceDiagram
     B->>B: generate RSA-2048 key pair<br/>(private key NON-extractable)
     B->>B: open front camera
     B->>SV: WebSocket /ws/challenge?purpose=register&roll=R
-    SV-->>B: 5 × ping / pong (server times them)
+    SV-->>B: 3 warm-up + 10 timed ping / pong (server times them)
     SV-->>B: nonce N, blinks_required K (2 or 3), capture 5 s
     B->>S: "Blink K times slowly"
     B->>B: record ~60 JPEG frames
@@ -183,8 +183,8 @@ sequenceDiagram
     S->>B: enters roll no., taps "Verify Face & Mark Presence"
     B->>B: load private key from IndexedDB, open camera
     B->>SV: WebSocket /ws/challenge?purpose=checkin&roll=R
-    SV-->>B: 5 × ping / pong
-    SV->>SV: median RTT ≤ 20 ms? (else reject + audit)
+    SV-->>B: 3 warm-up + 10 timed ping / pong
+    SV->>SV: fastest RTT ≤ 20 ms? (else reject + audit)
     SV-->>B: nonce N, blinks K
     B->>S: "Blink K times slowly"
     B->>B: record frames, sign "airgated|checkin|N|R|sha256(frames)"
@@ -209,7 +209,7 @@ written to the audit log.
 flowchart TD
     Start(["POST /api/checkin"]) --> G1{"1. Nonce<br/>known, unused, < 120 s,<br/>same roll + IP?"}
     G1 -- no --> R1["❌ checkin_bad_challenge"]
-    G1 -- yes --> G2{"2. Server-measured<br/>median RTT ≤ 20 ms?"}
+    G1 -- yes --> G2{"2. Server-measured<br/>fastest RTT ≤ 20 ms?"}
     G2 -- no --> R2["❌ latency_gate"]
     G2 -- yes --> G3{"Roll enrolled<br/>with a face?"}
     G3 -- no --> R3["❌ checkin_unregistered /<br/>checkin_no_face"]
@@ -388,6 +388,7 @@ requirements.txt        Python dependencies
 .env.example            GROQ_API_KEY placeholder (for the exam generator only)
 AirGated_Report.md      Original project write-up (May 2026)
 AirGated_Progress_Report.*  Critical-analysis progress report (Aug 2026)
+AirGated_Technical_Report_v2.*  Technical report v2.0 (Sep 2026): design, live trial, test evidence
 ```
 
 Not committed (see `.gitignore`): `.env`, `database.db`, `ssl_certs/`, `models/`, `evidence/`, `.venv/`.
@@ -457,7 +458,7 @@ Every test has the same three steps, often called *Arrange, Act, Assert*:
 Run all of them with:
 
 ```bash
-python -m pytest tests        # 30 tests, about 20 seconds
+python -m pytest tests        # 31 tests, about 20 seconds
 ```
 
 ### A real example, line by line
@@ -520,7 +521,7 @@ against each one.
 | Probes answered `204` to everyone (the original popup bug) | `test_probe_redirects_until_verified`, `test_http_listener_probe_behaviour` |
 | MAC check disabled | `test_mac_mismatch_rejected` |
 
-Every bug was caught. With the real code, all 30 tests pass.
+Every bug was caught. With the real code, all 31 tests pass.
 
 ### What each test checks
 
@@ -536,6 +537,7 @@ Every bug was caught. With the real code, all 30 tests pass.
 | `test_signature_from_other_device_rejected` | A different phone's key signs for R1 | Rejected, `bad_signature` audited |
 | `test_signature_must_cover_submitted_frames` | Sign one clip but upload another | Rejected, because video can't be swapped after signing |
 | `test_latency_gate_uses_server_rtt` | Server-measured RTT above the threshold | No nonce issued, `latency_gate` audited |
+| `test_rtt_gate_ignores_power_save_spikes` | Ping times from the live trial: honest phone with 100–200 ms power-save spikes, and a relayed link | Honest phone passes on its fastest ping; relayed link (fastest 36 ms) still fails |
 | `test_face_mismatch_rejected` | Face engine sees a different person | Rejected, `face_mismatch` audited |
 | `test_not_enough_blinks_rejected` | 1 blink when 2 were asked for | Rejected, and the message mentions blinks |
 | `test_mac_mismatch_rejected` | Check-in arrives from a different MAC | Rejected with the MAC message |
@@ -580,11 +582,11 @@ stay under 20 ms. Those need a trial with real phones.
 | 4.6 | Groq API key in source | Moved to `.env` (git-ignored); `.env.example` added |
 | 4.7 | New certificate on every restart | CA + certificate created once and reused; CA downloadable for one-time install |
 | 4.8 | Three overlapping implementations | Old ones moved to `archive/`; one live path |
-| 4.9 | No automated tests | 30 tests, checked with deliberate bugs |
+| 4.9 | No automated tests | 31 tests, checked with deliberate bugs |
 | 4.10 | Git out of date; DB and `__pycache__` tracked | Everything committed; DB and `__pycache__` removed from **all** history and ignored |
 | Section 5 | Challenge was a hard-coded constant (replayable forever) | Single-use server nonce bound to roll number, IP and purpose, with a 120 s expiry |
 | Section 7 "Later" | Rejections only printed to the console | `airgated_audit_log` table + `/admin` attendance dashboard (who's present or absent, who failed and why, 7-day trend) with enrollment reset |
-| *(new)* | Latency came from the phone (`current_rtt`), and only the last ping was timed | Server times 5 pings and takes the median |
+| *(new)* | Latency came from the phone (`current_rtt`), and only the last ping was timed | Server times 10 pings after 3 warm-ups and gates on the fastest (power-save spikes no longer reject honest phones) |
 | *(new)* | Friend could check in with your phone | KYC face + blink check at enrollment and every check-in |
 
 ### Still open: software problems (not hardware)
