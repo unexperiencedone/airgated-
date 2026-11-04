@@ -237,6 +237,7 @@
                 const res = await fetch("/api/checkin", { method: "POST", body: formData });
                 const result = await res.json();
                 if (result.status === "success") setStatus("status-box", "✅ " + result.message, "green");
+                else if (result.status === "reenroll") offerReRegistration(result);
                 else setStatus("status-box", "❌ " + result.message, "red");
             } catch (err) {
                 setStatus("status-box", "❌ " + err.message, "red");
@@ -244,6 +245,17 @@
                 closeCamera(stream);
                 btn.disabled = false;
             }
+        }
+
+        // Shown only when the server verified this device's key AND the face but the Wi-Fi MAC changed.
+        // Re-registering still requires a fresh face match server-side.
+        function offerReRegistration(result) {
+            setStatus("status-box", "⚠️ " + result.message, "#b45309");
+            show("register-box", true);
+            document.getElementById("reg-roll").value = result.roll_number;
+            document.getElementById("reg-name").value = result.name || "";
+            setStatus("reg-status", "Re-register this device: scan your face to continue.", "blue");
+            document.getElementById("register-box").scrollIntoView({ behavior: "smooth" });
         }
 
         async function handleRegistration() {

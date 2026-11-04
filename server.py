@@ -580,27 +580,69 @@ async def verify_checkin(
     if enrolled_face is None:
         return reject("checkin_no_face", "enrolled before face verification", "Face not enrolled yet. Re-open enrollment on this device.", status="error")
 
-    # Stage 3: link-layer binding
-    if client_ip not in LOOPBACK_HOSTS and registered_mac != "unknown_mac" and incoming_mac != registered_mac:
-        return reject("mac_mismatch", f"registered {registered_mac}", "Hardware MAC address signature mismatch.")
+    # Stage 3: link-layer binding. A changed MAC (e.g. the student forgot the Wi-Fi network, which
+    # gives the phone a new per-network address) is not rejected outright: stages 4 and 5 still
+    # run so the response can say exactly which checks did not match, and so a student whose key
+    # and face both verify is offered re-registration instead of losing the day.
+    mac_changed = (client_ip not in LOOPBACK_HOSTS and registered_mac != "unknown_mac"
+                   and incoming_mac != registered_mac)
+    problems = []   # (audit code, human-readable text) for every check that did not match
+    if mac_changed:
+        problems.append(("mac_mismatch", "Wi-Fi hardware (MAC) address differs from the one recorded at enrollment"))
+
+    def refuse_with_all_problems():
+        detail = f"registered {registered_mac}; failed: " + ", ".join(code for code, _ in problems)
+        audit("mac_mismatch", roll_number, client_ip, incoming_mac, detail)
+        lines = [f"{i}. {text}" for i, (_, text) in enumerate(problems, 1)]
+        return {"status": "fraud", "message": "Check-in refused. Not matching: " + " ".join(lines)}
 
     # Stage 4: device key signed this nonce and these exact frames
     blobs, error = await read_frames(frames)
     if error:
         return reject("checkin_bad_frames", error, error, status="error")
     if not signature_valid(public_key_hex, signature_hex, signed_message("checkin", nonce, roll_number, blobs)):
-        return reject("bad_signature", "signature did not verify", "Signature validation failed.")
+        if not mac_changed:
+            return reject("bad_signature", "signature did not verify", "Signature validation failed.")
+        problems.append(("bad_signature", "Device key signature did not verify (not the enrolled browser/device)"))
 
     # Stage 5: face liveness (blinks) + identity match against the enrolled face
     analysis, error = await analyze_face(blobs)
     if error:
-        return {"status": "error", "message": error}
+        if not mac_changed:
+            return {"status": "error", "message": error}
+        problems.append(("face_unreadable", error))
+        return refuse_with_all_problems()
+    face_score = None
     failure = analysis.liveness_failure(challenge.blinks_required)
     if failure:
-        return reject("liveness_failed", failure, failure)
-    score = face_verify.similarity(face_verify.embedding_from_bytes(enrolled_face), analysis.embedding)
-    if score < face_verify.MATCH_THRESHOLD:
-        return reject("face_mismatch", f"similarity {score:.3f}", "Face does not match the enrolled student.")
+        if not mac_changed:
+            return reject("liveness_failed", failure, failure)
+        problems.append(("liveness_failed", failure))
+    else:
+        face_score = face_verify.similarity(face_verify.embedding_from_bytes(enrolled_face), analysis.embedding)
+        if face_score < face_verify.MATCH_THRESHOLD:
+            if not mac_changed:
+                return reject("face_mismatch", f"similarity {face_score:.3f}", "Face does not match the enrolled student.")
+            problems.append(("face_mismatch", "Face does not match the enrolled student"))
+    score = face_score
+
+    if mac_changed:
+        if len(problems) > 1:
+            return refuse_with_all_problems()
+        # Only the MAC differs: the enrolled key signed this check-in and the face matches.
+        # Attendance is NOT marked; the student must re-register this device first.
+        audit("mac_changed_verified", roll_number, client_ip, incoming_mac,
+              f"registered {registered_mac}; key and face verified (face {score:.3f})")
+        with db_connect() as conn:
+            name_row = conn.execute("SELECT name FROM airgated_device_registry WHERE roll_number = ?",
+                                    (roll_number,)).fetchone()
+        return {
+            "status": "reenroll",
+            "message": "Your key and face match, but this phone's Wi-Fi hardware (MAC) address changed "
+                       "(usually because the network was forgotten). Re-register this device to continue.",
+            "roll_number": roll_number,
+            "name": name_row[0] if name_row else "",
+        }
 
     # Stage 6: one device, one profile per window
     with db_connect() as conn:
@@ -633,6 +675,7 @@ CHECKIN_FAILURES = {
     "checkin_unregistered": "Roll number not enrolled",
     "checkin_no_face": "Face not enrolled yet",
     "mac_mismatch": "Different device (MAC mismatch)",
+    "mac_changed_verified": "Wi-Fi address changed; key and face OK (asked to re-register)",
     "checkin_bad_frames": "Bad camera upload",
     "bad_signature": "Invalid device signature",
     "liveness_failed": "Liveness failed (blinks / face visibility)",
