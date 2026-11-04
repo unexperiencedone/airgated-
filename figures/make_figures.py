@@ -62,9 +62,9 @@ def fig_architecture():
     box(ax, 2.65, 1.85, 4.4, 0.85, "HTTPS :443 — FastAPI\nportal • /ws/challenge (RTT + nonce) • /api/register • /api/checkin • /admin", "green", fs=7.5, bold=False)
     box(ax, 2.65, 0.4, 1.4, 1.1, "Face engine\nYuNet → MediaPipe\n→ SFace\n(one clip at a time)", "purple", fs=7)
     box(ax, 4.2, 0.4, 1.3, 1.1, "SQLite\nregistry • records\n• audit log", "grey", fs=7)
-    box(ax, 5.65, 0.4, 1.4, 1.1, "Neighbour table\n/proc/net/arp\nIP → MAC", "grey", fs=7)
-    for y in (3.37, 2.17, 0.97):
-        arrow(ax, (1.8, y), (2.65, 3.3 if y > 3 else 2.9 if y > 2 else 2.2), None)
+    box(ax, 5.65, 0.4, 1.4, 1.1, "Neighbour table\nIP → MAC\n(OS-specific lookup)", "grey", fs=7)
+    for y, ty in ((3.37, 3.38), (2.17, 3.30), (0.97, 3.22)):
+        arrow(ax, (1.8, y), (2.65, ty), None)
     ax.text(2.2, 3.62, "Wi-Fi", ha="center", fontsize=7, style="italic")
     arrow(ax, (3.35, 3.0), (3.35, 2.7)); arrow(ax, (4.9, 3.0), (4.9, 2.7)); arrow(ax, (6.35, 3.0), (6.35, 2.7))
     arrow(ax, (3.35, 1.85), (3.35, 1.5)); arrow(ax, (4.85, 1.85), (4.85, 1.5)); arrow(ax, (6.35, 1.85), (6.35, 1.5))
