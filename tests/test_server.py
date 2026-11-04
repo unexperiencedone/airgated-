@@ -200,11 +200,57 @@ def test_not_enough_blinks_rejected(client, monkeypatch):
     assert "blinks" in result["message"]
 
 
-def test_mac_mismatch_rejected(client, monkeypatch):
+def attendance_count():
+    with sqlite3.connect(os.environ["AIRGATED_DB"]) as conn:
+        return conn.execute("SELECT COUNT(*) FROM airgated_attendance_records").fetchone()[0]
+
+
+def test_mac_changed_with_valid_key_and_face_offers_reregistration(client, monkeypatch):
+    device = Device()
+    enroll(client, device, name="Student One")
+    monkeypatch.setattr(server, "get_client_mac", lambda ip: "aa:bb:cc:dd:ee:99")
+    result = check_in(client, device)
+    assert result["status"] == "reenroll"
+    assert result["roll_number"] == "R1" and result["name"] == "Student One"
+    assert attendance_count() == 0                      # not marked present until re-registered
+    assert "mac_changed_verified" in audit_events()
+    # Re-registering (face-matched) on the new MAC then lets the student check in.
+    new_device = Device()
+    assert enroll(client, new_device, name="Student One")["status"] == "success"
+    assert check_in(client, new_device)["status"] == "success"
+
+
+def test_mac_changed_with_wrong_face_is_refused_and_lists_every_mismatch(client, monkeypatch):
     device = Device()
     enroll(client, device)
     monkeypatch.setattr(server, "get_client_mac", lambda ip: "aa:bb:cc:dd:ee:99")
-    assert check_in(client, device)["message"] == "Hardware MAC address signature mismatch."
+    monkeypatch.setattr(server.face_verify, "analyze", lambda frames: fake_analysis(embedding=OTHER_FACE))
+    result = check_in(client, device)
+    assert result["status"] == "fraud"
+    assert "MAC" in result["message"] and "Face does not match" in result["message"]
+    assert "signature" not in result["message"]         # the key did verify, so it is not listed
+    assert "reenroll" not in result.get("status", "") and "mac_changed_verified" not in audit_events()
+    assert attendance_count() == 0
+
+
+def test_mac_changed_with_foreign_key_lists_signature_and_mac(client, monkeypatch):
+    device = Device()
+    enroll(client, device)
+    monkeypatch.setattr(server, "get_client_mac", lambda ip: "aa:bb:cc:dd:ee:99")
+    result = check_in(client, Device())                  # key not enrolled for R1
+    assert result["status"] == "fraud"
+    assert "MAC" in result["message"] and "signature" in result["message"]
+    assert "mac_changed_verified" not in audit_events()
+
+
+def test_mac_changed_fewer_blinks_is_refused_with_all_reasons(client, monkeypatch):
+    device = Device()
+    enroll(client, device)
+    monkeypatch.setattr(server, "get_client_mac", lambda ip: "aa:bb:cc:dd:ee:99")
+    monkeypatch.setattr(server.face_verify, "analyze", lambda frames: fake_analysis(blinks=1))
+    result = check_in(client, device)
+    assert result["status"] == "fraud"
+    assert "MAC" in result["message"] and "blinks" in result["message"]
 
 
 def test_multi_profile_window(client, monkeypatch):
