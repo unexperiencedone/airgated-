@@ -83,10 +83,12 @@ def files(frames=FRAMES):
     return [("frames", (f"f{i}.jpg", blob, "image/jpeg")) for i, blob in enumerate(frames)]
 
 
-def enroll(client, device, roll="R1", name="Student One"):
+def enroll(client, device, roll="R1", name="Student One", old_device=None):
     nonce = get_challenge(client, "register", roll)["nonce"]
     data = {"roll_number": roll, "name": name, "public_key": device.public_hex,
             "nonce": nonce, "signature_hex": device.sign("register", nonce, roll)}
+    if old_device:   # re-keying must also be signed by the currently enrolled key
+        data["old_signature_hex"] = old_device.sign("register", nonce, roll)
     return client.post("/api/register", data=data, files=files()).json()
 
 
@@ -216,7 +218,7 @@ def test_mac_changed_with_valid_key_and_face_offers_reregistration(client, monke
     assert "mac_changed_verified" in audit_events()
     # Re-registering (face-matched) on the new MAC then lets the student check in.
     new_device = Device()
-    assert enroll(client, new_device, name="Student One")["status"] == "success"
+    assert enroll(client, new_device, name="Student One", old_device=device)["status"] == "success"
     assert check_in(client, new_device)["status"] == "success"
 
 
@@ -277,15 +279,24 @@ def test_device_cannot_enroll_second_roll(client):
 
 
 def test_reenroll_requires_face_match(client, monkeypatch):
-    enroll(client, Device())
-    monkeypatch.setattr(server, "get_client_mac", lambda ip: "aa:bb:cc:dd:ee:77")  # new phone / new random MAC
+    old = Device()
+    enroll(client, old)
+    monkeypatch.setattr(server, "get_client_mac", lambda ip: "aa:bb:cc:dd:ee:77")  # new network / new random MAC
     monkeypatch.setattr(server.face_verify, "analyze", lambda frames: fake_analysis(embedding=OTHER_FACE))
-    assert enroll(client, Device())["status"] == "error"
+    assert enroll(client, Device(), old_device=old)["status"] == "error"
     monkeypatch.setattr(server.face_verify, "analyze", lambda frames: fake_analysis())
     new_device = Device()
-    assert enroll(client, new_device)["status"] == "success"
+    assert enroll(client, new_device, old_device=old)["status"] == "success"
     assert check_in(client, new_device)["status"] == "success"
     assert "reenroll_device" in audit_events()
+
+
+def test_reenroll_without_old_key_is_refused_even_with_matching_face(client, monkeypatch):
+    enroll(client, Device())
+    monkeypatch.setattr(server, "get_client_mac", lambda ip: "aa:bb:cc:dd:ee:77")
+    assert enroll(client, Device())["status"] == "error"           # right face, no old-key signature
+    assert enroll(client, Device(), old_device=Device())["status"] == "error"   # signed by some other key
+    assert "reenroll_no_old_key" in audit_events()
 
 
 def test_register_catch_all_does_not_swallow_api(client):
