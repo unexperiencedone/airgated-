@@ -590,7 +590,7 @@ async def verify_checkin(
     if enrolled_face is None:
         return reject("checkin_no_face", "enrolled before face verification", "Face not enrolled yet. Re-open enrollment on this device.", status="error")
 
-    # Stage 3: link-layer binding. A changed MAC (e.g. the student forgot the Wi-Fi network, which
+    # Stage 3: link-layer binding. A changed MAC (e.g. a new network name, a changed private-address setting or, on an iPhone, forgetting the network, which
     # gives the phone a new per-network address) is not rejected outright: stages 4 and 5 still
     # run so the response can say exactly which checks did not match, and so a student whose key
     # and face both verify is offered re-registration instead of losing the day.

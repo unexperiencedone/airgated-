@@ -97,7 +97,7 @@ def fig_checkin():
     # after the face stage three outcomes
     cx = x0 + w / 2
     box(ax, 0.1, 0.55, 1.95, 0.75, "MAC ok, all checks pass\n6  one MAC, one roll / 60 s?\n→ attendance recorded", "blue", fs=6.9)
-    box(ax, 2.2, 0.55, 2.05, 0.75, "Only MAC differs; key + face OK\n→ NOT marked present;\nre-register offer (face re-key)", "amber", fs=6.9)
+    box(ax, 2.2, 0.55, 2.05, 0.75, "Only MAC differs; key + face OK\n→ NOT marked present;\nre-register offer (key + face)", "amber", fs=6.9)
     box(ax, 4.4, 0.55, 2.1, 0.75, "MAC differs AND another check\nfails → refused; message lists\nevery mismatching check", "red", edge=C["redge"], fs=6.9)
     arrow(ax, (cx, ys[-1]), (1.1, 1.3)); arrow(ax, (cx, ys[-1]), (3.2, 1.3)); arrow(ax, (cx, ys[-1]), (5.45, 1.3))
     ax.text(5.2, 3.1, "Gate 3 is evaluated first\nbut only acted on after\ngates 4 and 5", ha="center", va="center", fontsize=7, style="italic")

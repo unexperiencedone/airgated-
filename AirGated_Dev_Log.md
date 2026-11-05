@@ -94,12 +94,12 @@ The registered `36:59:ce:…` and the later `e6:4d:…` are randomized; `00:9c:c
 hardware address. So the phone presented a different address on the new network than on the old hotspot.
 
 **Observation (tested on 6 phones over 3–4 days on the Windows hotspot, no MAC settings changed):**
-a phone keeps the same MAC on a given network, randomized or not, until the network is forgotten.
+a phone keeps the same MAC on a given network, randomized or not.
 On Linux the same phone also kept `e6:4d:43:..` across repeated check-ins and reconnects. It follows
-that the MAC changes only when the network changes (new hotspot name) or is forgotten. Moving from the
+that the MAC changed here because the network changed (new hotspot name). Android derives it from the SSID and security type and keeps it even if the network is forgotten; iPhones (iOS 18+) discard it when the network is forgotten. Moving from the
 Windows hotspot to the Linux one therefore changed it for every enrolled student.
 
-**Design consequence:** a student who forgets the network by mistake must not lose their attendance.
+**Design consequence:** a student whose MAC changes (new network name, private-address setting, or forgetting the network on an iPhone) must not lose their attendance.
 Re-registration already existed (face match re-keys the device), but check-in rejected on the MAC before
 looking at the key or face, and the message said nothing useful.
 
