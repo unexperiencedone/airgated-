@@ -313,6 +313,11 @@ flowchart TD
     F -- no --> X3["❌ ask instructor to reset"]
 ```
 
+**Re-keying also needs the old key.** A re-key is accepted only if the request is signed by the currently
+enrolled key *and* the new face matches (`reenroll_no_old_key` otherwise). A phone that is lost or a browser
+that was cleared has no old key, so it needs an instructor reset. If only the MAC changed and the key and
+face verify at check-in, the student is offered this re-registration (`mac_changed_verified`).
+
 If a student loses their phone, the instructor uses **Reset a student's enrollment** on the `https://localhost/admin` dashboard. That deletes the old key and face so the student can enroll again from the new phone. Every reset is logged (`instructor_reset`).
 
 ---
@@ -434,7 +439,7 @@ python fetch_models.py            # ~42 MB into models/
 
 **One-time steps for each student:**
 
-- Turn off **"Private Wi-Fi address"** (iOS) or **"Randomized MAC"** (Android) for the class network.
+- Keep the phone's Wi-Fi address setting unchanged for the class network and use the same network name each time. Phones normally keep one address per network; if it does change, the system offers re-registration (see section 8).
 - Optional: install the classroom certificate from `http://192.168.137.1/airgated-ca.crt` to avoid the browser warning.
 
 **Hardware note:** Windows Mobile Hotspot allows only 8 devices. For a full class, use a travel
@@ -462,7 +467,7 @@ Every test has the same three steps, often called *Arrange, Act, Assert*:
 Run all of them with:
 
 ```bash
-python -m pytest tests        # 31 tests, about 20 seconds
+python -m pytest tests        # 39 tests, about 20 seconds
 ```
 
 ### A real example, line by line
@@ -514,8 +519,8 @@ flowchart LR
 
 A test that always passes is worthless. The way to check a test is to **break the code on
 purpose and see whether the test notices**. This is called *mutation testing*. It was done for
-this repo: five deliberate bugs were put into a throwaway copy of the code, and the tests were run
-against each one.
+this repo: seven deliberate bugs were put into a throwaway copy of the code, and the 39-test suite was run
+against each one (output in `results/mutation_2026-11-05.txt`).
 
 | Deliberate bug put into the code | Test(s) that caught it |
 |---|---|
@@ -523,9 +528,11 @@ against each one.
 | Face-similarity check removed | `test_face_mismatch_rejected` |
 | Blink counter counts each blink twice | 4 cases of `test_count_blinks` |
 | Probes answered `204` to everyone (the original popup bug) | `test_probe_redirects_until_verified`, `test_http_listener_probe_behaviour` |
-| MAC check disabled | `test_mac_mismatch_rejected` |
+| MAC check disabled | `test_mac_changed_with_wrong_face_is_refused_and_lists_every_mismatch` and others |
+| Re-key accepted without the enrolled key | `test_reenroll_without_old_key_is_refused_even_with_matching_face` |
+| Identity compared only with the clip's mean (a half-and-half face swap passes) | `test_person_swapped_mid_clip_fails` |
 
-Every bug was caught. With the real code, all 31 tests pass.
+Every bug was caught. With the real code, all 39 tests pass.
 
 ### What each test checks
 
@@ -586,7 +593,7 @@ stay under 20 ms. Those need a trial with real phones.
 | 4.6 | Groq API key in source | Key moved out of the code; later the exam generator that needed it was removed entirely, so there's no API key at all |
 | 4.7 | New certificate on every restart | CA + certificate created once and reused; CA downloadable for one-time install |
 | 4.8 | Three overlapping implementations | Old ones moved to `archive/`; one live path |
-| 4.9 | No automated tests | 31 tests, checked with deliberate bugs |
+| 4.9 | No automated tests | 39 tests, checked with deliberate bugs |
 | 4.10 | Git out of date; DB and `__pycache__` tracked | Everything committed; DB and `__pycache__` removed from **all** history and ignored |
 | Section 5 | Challenge was a hard-coded constant (replayable forever) | Single-use server nonce bound to roll number, IP and purpose, with a 120 s expiry |
 | Section 7 "Later" | Rejections only printed to the console | `airgated_audit_log` table + `/admin` attendance dashboard (who's present or absent, who failed and why, 7-day trend) with enrollment reset |
@@ -600,16 +607,19 @@ stay under 20 ms. Those need a trial with real phones.
    look-left/look-right challenge, would make this much harder.
 2. **Face threshold not tuned.** 0.363 is OpenCV's general-purpose value. It needs checking on real
    students, lighting and cheap front cameras to balance false rejections against false matches.
-3. **Not yet tested on a real phone.** The popup fix, the camera flow in Chrome and Safari, and blink
-   detection at about 12 fps are verified only by automated tests and a laptop-only run.
+3. **Little real-phone testing.** The popup fix, the camera flow and blink detection at about 12 fps
+   have been run on a few real phones (a three-student trial and informal sessions), not systematically
+   across phone models and browsers.
 4. **Camera doesn't work inside the OS popup.** Students must switch to a real browser, which is extra
    friction. This is an OS limitation that software can only work around.
 5. **Certificate warning is still possible.** A private IP can't get a publicly trusted certificate,
    so each phone either installs the classroom CA once or clicks through a warning.
 6. **Proximity means "on the network", not "in the room".** Wi-Fi reaches hallways. The face check
    proves *who* is holding the phone, not *where* they are.
-7. **MAC randomization can't be detected.** If a student forgets to turn it off, they fail the MAC
-   check. They can recover by re-enrolling with their face.
+7. **A changed MAC is not a security boundary.** A student can change their MAC without root (private
+   address setting, forgetting the network), which also sidesteps the "one phone, one student" and
+   60-second rules; the key and face checks are what remain. If only the MAC changed and key and face
+   verify, the student is offered re-registration instead of a rejection.
 8. **No rate limiting.** The challenge WebSocket and the APIs don't limit repeated attempts from one phone.
 9. **Dashboard has no password.** It relies only on "requests from the laptop itself".
 10. **In-memory state.** Nonces and verified phones are lost on restart, and the design assumes a
@@ -618,4 +628,8 @@ stay under 20 ms. Those need a trial with real phones.
     and nobody has measured whether 60+ students close together keep the latency gate reliable.
 12. **Biometric data handling.** Face embeddings and evidence photos are stored with no automatic
     deletion and no consent screen, which students and the institution may require.
-13. **Leftovers.** `AirGated_Report.md` still describes the old design as "production-ready".
+13. **Video replay and the blink count.** The blink check is a minimum, so a recording with enough blinks
+    passes for either requested count. A random head-turn challenge is the planned countermeasure.
+14. **Re-keying needs the old key.** A lost phone or cleared browser has no old key, so it needs an
+    in-person instructor reset. The key is tied to the portal's address (`192.168.137.1`); changing that
+    address would force every student through a reset.

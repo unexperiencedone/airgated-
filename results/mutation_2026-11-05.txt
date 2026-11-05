@@ -1,0 +1,8 @@
+CAUGHT  nonce not deleted after use                      1 failed, 15 passed, 1 warning in 1.81s
+CAUGHT  check-in face-similarity check removed           1 failed, 22 passed, 1 warning in 2.35s
+CAUGHT  blink counter increments by two                  1 failed, 1 warning in 0.46s
+CAUGHT  probes answered 204/success for every client     1 failed, 33 passed, 1 warning in 3.65s
+CAUGHT  MAC comparison disabled                          1 failed, 24 passed, 1 warning in 2.43s
+CAUGHT  re-key without checking the old key              1 failed, 31 passed, 1 warning in 3.67s
+CAUGHT  identity checked only against the clip mean      1 failed, 11 passed, 1 warning in 1.26s
+baseline: (0, '39 passed, 1 warning in 4.47s')
