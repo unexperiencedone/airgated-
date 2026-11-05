@@ -1,6 +1,8 @@
 import os
 import sys
+import types
 
+import cv2
 import numpy as np
 import pytest
 
@@ -46,3 +48,45 @@ def test_models_reject_blank_frames():
     result = face_verify.analyze([blank] * 5)
     assert result.frames_with_face == 0
     assert result.liveness_failure(2) is not None
+
+
+A, B = 50, 200   # grey levels standing in for two different people
+
+
+def _analyze_clip(monkeypatch, clip):
+    """clip = list of (person, blink score). The models are stubbed so only the decision logic runs."""
+    ids = {A: np.eye(128)[0], B: np.eye(128)[1]}
+    scores = iter(score for _, score in clip)
+    ns = types.SimpleNamespace
+    models = ns(
+        detector=ns(setInputSize=lambda size: None,
+                    detect=lambda img: (1, np.array([[0, 0, 10, 10, 0.9]], dtype=np.float32))),
+        recognizer=ns(alignCrop=lambda img, face: img, feature=lambda img: ids[int(img[0, 0, 0])]),
+        landmarker=ns(detect=lambda img: (lambda s: ns(face_blendshapes=[[
+            ns(category_name="eyeBlinkLeft", score=s), ns(category_name="eyeBlinkRight", score=s)]]))(next(scores))),
+    )
+    monkeypatch.setattr(face_verify, "_get_models", lambda: models)
+    return face_verify.analyze([
+        cv2.imencode(".png", np.full((64, 64, 3), person, np.uint8))[1].tobytes() for person, _ in clip])
+
+
+def _blinking(person):
+    return ([(person, 0.05)] * 10 + [(person, 0.9)] * 2) * 3 + [(person, 0.05)] * 10
+
+
+def test_same_person_passes(monkeypatch):
+    result = _analyze_clip(monkeypatch, [(A, 0.05)] * 16 + _blinking(A))
+    assert result.embedding is not None and result.liveness_failure(3) is None
+
+
+@pytest.mark.parametrize("lead", [14, 23])
+def test_person_swapped_mid_clip_fails(monkeypatch, lead):
+    """Still of person A first, then person B blinking: identity must be judged across the whole clip."""
+    result = _analyze_clip(monkeypatch, [(A, 0.05)] * lead + _blinking(B))
+    assert result.embedding is None and result.liveness_failure(3) is not None
+
+
+def test_sample_spread_covers_the_whole_clip():
+    picked = face_verify._sample_spread(list(range(120)), 12)
+    assert len(picked) == 12 and picked[0] < 10 and picked[-1] >= 110
+    assert face_verify._sample_spread([1, 2, 3], 12) == [1, 2, 3]

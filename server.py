@@ -413,6 +413,7 @@ async def websocket_challenge_endpoint(websocket: WebSocket):
     client_ip = websocket.client.host
     try:
         if purpose not in ("register", "checkin") or not roll_number:
+            audit("bad_challenge_request", roll_number, client_ip, None, f"purpose={purpose!r}")
             await websocket.send_json({"type": "error", "reason": "Bad challenge request."})
             await websocket.close()
             return
@@ -456,6 +457,7 @@ async def register_student(
     nonce: str = Form(...),
     signature_hex: str = Form(...),
     frames: list[UploadFile] = File(...),
+    old_signature_hex: str = Form(""),
 ):
     roll_number, name = roll_number.strip(), name.strip()
     client_ip = request.client.host
@@ -468,10 +470,12 @@ async def register_student(
         return {"status": "error", "message": error}
 
     if hardware_mac == "unknown_mac" and client_ip not in LOOPBACK_HOSTS:
+        audit("register_unknown_mac", roll_number, client_ip, hardware_mac, "no neighbour-table entry")
         return {"status": "error", "message": "Could not extract physical MAC signature. Reconnect to class network."}
 
     blobs, error = await read_frames(frames)
     if error:
+        audit("register_bad_frames", roll_number, client_ip, hardware_mac, error)
         return {"status": "error", "message": error}
 
     # Proof of possession: the new key must have signed this nonce and these exact frames.
@@ -481,6 +485,7 @@ async def register_student(
 
     analysis, error = await analyze_face(blobs)
     if error:
+        audit("register_face_engine_error", roll_number, client_ip, hardware_mac, error)
         return {"status": "error", "message": error}
     failure = analysis.liveness_failure(challenge.blinks_required)
     if failure:
@@ -499,7 +504,7 @@ async def register_student(
             return {"status": "error", "message": "This device is already enrolled to another roll number. Ask the instructor to reset it."}
 
         cursor.execute(
-            "SELECT hardware_mac, face_embedding FROM airgated_device_registry WHERE roll_number = ?",
+            "SELECT hardware_mac, face_embedding, public_key_hex FROM airgated_device_registry WHERE roll_number = ?",
             (roll_number,),
         )
         existing = cursor.fetchone()
@@ -514,10 +519,15 @@ async def register_student(
             print(f"✅ [Enrolled] Roll: {roll_number} | MAC: {hardware_mac}")
             return {"status": "success", "message": "Device and face enrolled successfully!"}
 
-        registered_mac, enrolled_face = existing
+        registered_mac, enrolled_face, enrolled_key = existing
         if enrolled_face is not None:
-            # Re-enrollment (cleared browser data, new phone, randomized MAC): the enrolled face
-            # is the proof of identity, replacing the old silent "trust whoever has this MAC" reset.
+            # Re-keying needs BOTH the currently enrolled key (a signature over this request's nonce
+            # and frames) and the enrolled face. A lost phone or cleared browser has no old key and
+            # goes through an in-person instructor reset instead.
+            if not (old_signature_hex and signature_valid(
+                    enrolled_key, old_signature_hex, signed_message("register", nonce, roll_number, blobs))):
+                audit("reenroll_no_old_key", roll_number, client_ip, hardware_mac, "not signed by the enrolled key")
+                return {"status": "error", "message": "This roll number is enrolled on another device or browser. Ask the instructor to reset it."}
             score = face_verify.similarity(face_verify.embedding_from_bytes(enrolled_face), analysis.embedding)
             if score < face_verify.MATCH_THRESHOLD:
                 audit("reenroll_face_mismatch", roll_number, client_ip, hardware_mac, f"similarity {score:.3f}")
@@ -609,7 +619,7 @@ async def verify_checkin(
     analysis, error = await analyze_face(blobs)
     if error:
         if not mac_changed:
-            return {"status": "error", "message": error}
+            return reject("face_engine_error", error, error, status="error")
         problems.append(("face_unreadable", error))
         return refuse_with_all_problems()
     face_score = None
@@ -639,7 +649,7 @@ async def verify_checkin(
         return {
             "status": "reenroll",
             "message": "Your key and face match, but this phone's Wi-Fi hardware (MAC) address changed "
-                       "(usually because the network was forgotten). Re-register this device to continue.",
+                       "(for example a different network name or a changed Wi-Fi address setting). Re-register this device to continue.",
             "roll_number": roll_number,
             "name": name_row[0] if name_row else "",
         }
@@ -681,6 +691,7 @@ CHECKIN_FAILURES = {
     "liveness_failed": "Liveness failed (blinks / face visibility)",
     "face_mismatch": "Face did not match enrolled student",
     "multi_profile": "One device used for several students",
+    "face_engine_error": "Face engine unavailable",
 }
 ENROLLMENT_FAILURES = {
     "register_bad_challenge": "Expired or reused request",
@@ -689,6 +700,10 @@ ENROLLMENT_FAILURES = {
     "register_device_taken": "Device already enrolled to another roll",
     "reenroll_face_mismatch": "Re-enrollment face did not match",
     "legacy_upgrade_refused": "Roll enrolled from another device",
+    "reenroll_no_old_key": "Re-key attempted without the enrolled key",
+    "register_unknown_mac": "MAC could not be resolved",
+    "register_bad_frames": "Bad camera upload",
+    "register_face_engine_error": "Face engine unavailable",
 }
 TREND_DAYS = 7
 
@@ -802,6 +817,8 @@ async def admin_dashboard(request: Request, date: str = ""):
         (_fmt_time(ts), roll, ENROLLMENT_FAILURES[event], detail)
         for ts, event, roll, detail in enroll_fails
     ]
+    # Successful re-keys are shown too: a hijacked roll number would appear here.
+    rekey_rows = [(_fmt_time(ts), roll, detail) for ts, event, roll, detail in events if event == "reenroll_device"]
 
     page = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -849,6 +866,9 @@ async def admin_dashboard(request: Request, date: str = ""):
 
     <h2>Failed enrollments ({len(enroll_rows)})</h2>
     <div class="panel">{_table(["Time", "Roll", "Reason", "Detail"], enroll_rows, "No failed enrollments.")}</div>
+
+    <h2>Device re-keys ({len(rekey_rows)})</h2>
+    <div class="panel">{_table(["Time", "Roll", "Detail"], rekey_rows, "No re-keys.")}</div>
 
     <h2>Reset a student's enrollment</h2>
     <div class="panel"><p class="empty">For a lost or replaced phone: this deletes the student's device key and

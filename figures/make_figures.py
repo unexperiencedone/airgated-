@@ -158,7 +158,7 @@ def fig_student():
         (H, B, "REFUSED: message lists every mismatch", "red"),
         (H, B, "OFFER: key + face OK, MAC changed, re-register", "dash"),
         ("phase", "4  Re-register (only after the offer above)"),
-        (B, H, "new key + fresh face clip", ""),
+        (B, H, "new key, signed by old key + fresh face clip", ""),
         (H, B, "face matched \u2192 re-keyed, new MAC stored", ""),
         (B, H, "check in again \u2192 PRESENT", ""),
     ]

@@ -1,0 +1,38 @@
+# loadtest_checkin.py -n 1,5,10,20 --spread 3 --capture-secs 1  (plain HTTP on loopback; no TLS, no neighbour-table lookup)
+# run 2026-11-05 on 20 logical CPUs; face code after the identity-sampling change
+Private test server on 127.0.0.1:60003, scratch DB /tmp/airgated-load-g3mp5gwl/load.db
+Warm-up (loads the face models, not counted)...
+Baseline: one check-in with nothing else running...
+  analysis takes 2.02s. The face engine runs one clip at a time, so even a perfect queue finishes at most 30 check-ins per minute.
+
+=== 1 students (wall 3.7s) ===
+  finished analysis       : 1/1
+  latency-gate rejections : 0/1   (issued challenges with RTT > 20 ms: 0)
+  server-measured RTT ms  : p50 0.2  p95 0.2  max 0.2
+  check-in response time  : p50 2.3s  p95 2.3s  max 2.3s
+  throughput              : 16.3 check-ins/min
+  replies                 : {'Liveness check failed: asked for 2 blinks, saw 0.': 1}
+
+=== 5 students (wall 10.8s) ===
+  finished analysis       : 5/5
+  latency-gate rejections : 0/5   (issued challenges with RTT > 20 ms: 0)
+  server-measured RTT ms  : p50 0.4  p95 0.8  max 0.9
+  check-in response time  : p50 5.2s  p95 6.8s  max 7.0s
+  throughput              : 27.8 check-ins/min
+  replies                 : {'Liveness check failed: asked for 2 blinks, saw 0.': 1, 'Liveness check failed: asked for 3 blinks, saw 0.': 4}
+
+=== 10 students (wall 20.4s) ===
+  finished analysis       : 10/10
+  latency-gate rejections : 0/10   (issued challenges with RTT > 20 ms: 0)
+  server-measured RTT ms  : p50 0.4  p95 0.5  max 0.6
+  check-in response time  : p50 9.3s  p95 16.2s  max 16.9s
+  throughput              : 29.5 check-ins/min
+  replies                 : {'Liveness check failed: asked for 2 blinks, saw 0.': 6, 'Liveness check failed: asked for 3 blinks, saw 0.': 4}
+
+=== 20 students (wall 40.9s) ===
+  finished analysis       : 20/20
+  latency-gate rejections : 0/20   (issued challenges with RTT > 20 ms: 0)
+  server-measured RTT ms  : p50 0.4  p95 0.6  max 0.8
+  check-in response time  : p50 19.1s  p95 35.1s  max 37.0s
+  throughput              : 29.3 check-ins/min
+  replies                 : {'Liveness check failed: asked for 3 blinks, saw 0.': 9, 'Liveness check failed: asked for 2 blinks, saw 0.': 11}

@@ -59,7 +59,6 @@
             <input type="text" id="reg-name" placeholder="e.g., David Dhawan" autocomplete="off" required>
             <button type="button" class="btn-register" id="regBtn" onclick="handleRegistration()">Scan Face &amp; Enroll</button>
         </form>
-        <div class="hint">Before enrolling, turn off "Private Wi-Fi address" / "Randomized MAC" for this network in your Wi-Fi settings.</div>
     </div>
 
     <script>
@@ -288,6 +287,9 @@
                 formData.append("public_key", pubHex);
                 formData.append("nonce", challenge.nonce);
                 formData.append("signature_hex", await signSubmission(keyPair.privateKey, "register", challenge.nonce, roll, frames));
+                // Re-registration: the currently enrolled key (if this browser still has it) must sign too.
+                const oldKey = await getStoredPrivateKey();
+                if (oldKey) formData.append("old_signature_hex", await signSubmission(oldKey, "register", challenge.nonce, roll, frames));
                 appendFrames(formData, frames);
 
                 const res = await fetch("/api/register", { method: "POST", body: formData });

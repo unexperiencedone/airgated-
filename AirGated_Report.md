@@ -150,7 +150,7 @@ As the sole **Principal Engineer and System Architect** of this architecture, te
 
 ## VI. Conclusion & Production Blueprint
 
-The core system validation proves that **high-security proximity verification does not require complex remote infrastructures or intrusive data collection**. By anchoring user validation directly onto hardware-backed encryption keys and cross-checking them against native link-layer telemetry, AirGated delivers an un-spoofable, production-ready attendance platform designed for modern offline environments.
+The core system validation proves that **high-security proximity verification does not require complex remote infrastructures or intrusive data collection**. By anchoring user validation directly onto hardware-backed encryption keys and cross-checking them against native link-layer telemetry, AirGated is a working prototype of an offline attendance platform for modern offline environments; it is not production-ready (see README section 14 and the technical report for what remains).
 
 ---
 

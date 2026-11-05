@@ -12,6 +12,7 @@ it one consistent person, does that person match the enrolled face) is made here
 client page cannot simply claim it passed.
 """
 import os
+import secrets
 import threading
 from dataclasses import dataclass, field
 
@@ -124,10 +125,24 @@ def embedding_from_bytes(blob):
     return np.frombuffer(blob, dtype=np.float32)
 
 
+def _sample_spread(items, count):
+    """Pick up to `count` items: one at random from each of `count` equal slices of the clip.
+
+    Sampling across the whole clip (not just its start) means a clip that begins with a photo of the
+    enrolled student and continues with someone else is judged on both halves. The random pick inside
+    each slice keeps an attacker from knowing which frames will be examined.
+    """
+    if len(items) <= count:
+        return list(items)
+    edges = np.linspace(0, len(items), count + 1).astype(int)
+    return [items[int(lo) + secrets.randbelow(int(hi - lo))] for lo, hi in zip(edges, edges[1:])]
+
+
 def analyze(frame_blobs):
     """Run detection, blink scoring and embedding over an ordered list of JPEG frames."""
     result = FaceAnalysis(frames_total=len(frame_blobs))
     features = []
+    open_eye = []   # (image, face, jpeg) for every eyes-open frame; sampled across the clip below
     best_score = -1.0
 
     with _models_lock:
@@ -161,19 +176,23 @@ def analyze(frame_blobs):
                     score = (shapes["eyeBlinkLeft"] + shapes["eyeBlinkRight"]) / 2.0
             result.blink_scores.append(score)
 
-            # Identity features only from open-eye frames, spread across the clip.
-            if score is not None and score <= BLINK_OPEN_SCORE and len(features) < MAX_EMBEDDING_FRAMES:
-                aligned = models.recognizer.alignCrop(img, face)
-                features.append(_normalize(models.recognizer.feature(aligned)))
-                if face[-1] > best_score:
-                    best_score = face[-1]
-                    result.best_frame_jpeg = blob
+            if score is not None and score <= BLINK_OPEN_SCORE:
+                open_eye.append((img, face, blob))
+
+        # Identity features from eyes-open frames sampled across the whole clip (still inside the
+        # lock: the recognizer is not thread-safe).
+        for img, face, blob in _sample_spread(open_eye, MAX_EMBEDDING_FRAMES):
+            aligned = models.recognizer.alignCrop(img, face)
+            features.append(_normalize(models.recognizer.feature(aligned)))
+            if face[-1] > best_score:
+                best_score = face[-1]
+                result.best_frame_jpeg = blob
 
     result.blinks = count_blinks(result.blink_scores)
     if len(features) >= MIN_EMBEDDING_FRAMES:
-        mean = _normalize(np.mean(features, axis=0))
-        # Every sampled frame must look like the same person, so a clip can't start with the
-        # enrolled student and swap to someone else (or vice versa) partway through.
-        if min(similarity(f, mean) for f in features) >= MATCH_THRESHOLD:
-            result.embedding = mean
+        # Every sampled pair must be the same person. Comparing each frame only with the clip's mean
+        # is not enough: a half-and-half mix of two people scores about 0.71 against its own mean.
+        matrix = np.stack(features)
+        if float((matrix @ matrix.T).min()) >= MATCH_THRESHOLD:
+            result.embedding = _normalize(np.mean(features, axis=0))
     return result
