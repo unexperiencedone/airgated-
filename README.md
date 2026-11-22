@@ -633,3 +633,7 @@ stay under 20 ms. Those need a trial with real phones.
 14. **Re-keying needs the old key.** A lost phone or cleared browser has no old key, so it needs an
     in-person instructor reset. The key is tied to the portal's address (`192.168.137.1`); changing that
     address would force every student through a reset.
+
+---
+
+© 2026 KaiketsuTech. All rights reserved. AirGated is a KaiketsuTech research product (https://www.kaiketsutech.online).
